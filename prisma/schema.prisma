@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Ticket {
+  id           Int       @id @default(autoincrement())
+  waFrom       String
+  reason       String
+  status       String
+  payload      Json?
+  assignee     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  messages     Message[]
+}
+
+model Message {
+  id        Int      @id @default(autoincrement())
+  ticketId  Int
+  ticket    Ticket   @relation(fields: [ticketId], references: [id])
+  direction String
+  body      String
+  createdAt DateTime @default(now())
+}
+
+model ConversationState {
+  id        Int      @id @default(autoincrement())
+  waFrom    String   @unique
+  flow      String?
+  step      Int      @default(0)
+  data      Json?
+  updatedAt DateTime @updatedAt
+}
