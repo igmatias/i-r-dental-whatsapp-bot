@@ -38,62 +38,10 @@ const SEDES = {
   },
 };
 
-const TXT_BIENVENIDA = `¡Hola! 👋 Gracias por escribirnos a i-R Dental.
-
-${HOURS}
-
-${NO_TURNO}
-
-Elegí una opción del menú para continuar.`;
-
-const TXT_ESTUDIOS = `🧾 Estudios i-R Dental:
-• Panorámica (OPG)
-• Cefalométrica (lateral/PA)
-• Periapicales
-• Oclusales
-• Serie completa
-• ATM básica
-• CBCT / Tomografía (si corresponde)
-• Fotografías intra/extraorales (si corresponde)
-
-✅ SIN TURNO, por orden de llegada.`;
-
-const TXT_OBRAS = `🧾 Obras sociales activas:
-• AMFFA
-• ANSSAL APDIS
-• APESA SALUD
-• CENTRO MEDICO PUEYRREDON
-• COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES
-• DASUTEN
-• DOCTHOS
-• ELEVAR*
-• ESPORA SALUD*
-• FATFA
-• FEMEBA AVELLANEDA
-• HOSPITAL BRITANICO
-• HOSPITAL ITALIANO
-• LUIS PASTEUR
-• MEDICUS*
-• NUBIAL
-• OMA
-• OMINT*
-• OSDE
-• OSDIPP
-• OSMEBA
-• OPSA
-• PODER JUDICIAL (en orden de Federación Odontológica)*
-• PROGRAMAS MEDICOS
-• QUALITAS
-• SANCOR SALUD*
-• SERVESALUD*
-• SETIA
-• SIMECO
-• SIND. MUNIC. AVELLANEDA
-• SWISS MEDICAL*
-
-(*) En la orden debe incluirse el Diagnóstico.
-
-⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`;
+const TXT_BIENVENIDA =
+  "¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n" +
+  `${HOURS}\n\n${NO_TURNO}\n\n` +
+  "Elegí una opción del menú para continuar.";
 
 // ======== HELPERS =========
 async function sendJson(to, payload) {
@@ -114,50 +62,58 @@ async function sendJson(to, payload) {
   return { ok: r.ok, status: r.status, data };
 }
 
-async function sendText(to, body) {
-  return sendJson(to, { type: "text", text: { body } });
-}
+const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
 
 async function sendMainMenu(to) {
-  // Usamos LISTA para poder ofrecer muchas opciones
-  const rows = [
-    { id: "MENU_INFO_GENERAL", title: "ℹ️ Información general" },
-    { id: "MENU_SEDES", title: "📍 Información de sedes" },
-    { id: "MENU_ESTUDIOS", title: "🧾 Estudios que realizamos" },
-    { id: "MENU_OBRAS", title: "💳 Obras sociales activas" },
-    { id: "MENU_ENVIO", title: "📤 Solicitar envío de un estudio" },
-    { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
-    { id: "MENU_OPERADOR", title: "🗣️ Hablar con una persona" },
-  ].map(r => ({ id: r.id, title: r.title }));
-
+  // Lista interactiva (body/footer sin 'type')
   return sendJson(to, {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "i-R Dental" },
-      body: { type: "text", text: TXT_BIENVENIDA },
-      footer: { type: "text", text: "Seleccioná una opción" },
+      header: { type: "text", text: "i-R Dental" }, // header sí admite 'type'
+      body: { text: TXT_BIENVENIDA },               // ✅ sin 'type'
+      footer: { text: "Seleccioná una opción" },    // ✅ sin 'type'
       action: {
         button: "Abrir menú",
-        sections: [{ title: "Opciones", rows }],
+        sections: [
+          {
+            title: "Opciones",
+            rows: [
+              { id: "MENU_INFO_GENERAL", title: "ℹ️ Información general" },
+              { id: "MENU_SEDES",        title: "📍 Información de sedes" },
+              { id: "MENU_ESTUDIOS",     title: "🧾 Estudios que realizamos" },
+              { id: "MENU_OBRAS",        title: "💳 Obras sociales activas" },
+              { id: "MENU_ENVIO",        title: "📤 Solicitar envío de un estudio" },
+              { id: "MENU_SUBIR_ORDEN",  title: "📎 Subir orden" },
+              { id: "MENU_OPERADOR",     title: "🗣️ Hablar con una persona" },
+            ],
+          },
+        ],
       },
     },
   });
 }
 
 async function sendSedesList(to) {
-  const rows = [
-    { id: "SEDE_QUILMES", title: "Quilmes — Olavarría 88" },
-    { id: "SEDE_AVELL", title: "Avellaneda — 9 de Julio 64 — 2° A" },
-    { id: "SEDE_LOMAS", title: "Lomas de Zamora — España 156 — PB" },
-  ];
   return sendJson(to, {
     type: "interactive",
     interactive: {
       type: "list",
       header: { type: "text", text: "Sedes i-R Dental" },
-      body: { type: "text", text: "Elegí una sede para ver dirección, contacto y cómo llegar." },
-      action: { button: "Elegir sede", sections: [{ title: "Sedes", rows }] },
+      body: { text: "Elegí una sede para ver dirección, contacto y cómo llegar." }, // ✅ sin 'type'
+      action: {
+        button: "Elegir sede",
+        sections: [
+          {
+            title: "Sedes",
+            rows: [
+              { id: "SEDE_QUILMES", title: "Quilmes — Olavarría 88" },
+              { id: "SEDE_AVELL",   title: "Avellaneda — 9 de Julio 64 — 2° A" },
+              { id: "SEDE_LOMAS",   title: "Lomas de Zamora — España 156 — PB" },
+            ],
+          },
+        ],
+      },
     },
   });
 }
@@ -195,30 +151,23 @@ export default async function handler(req, res) {
       console.log("WEBHOOK BODY:", JSON.stringify(body));
 
       const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      if (!msg) return res.status(200).json({ ok: true }); // eventos no relacionados (statuses, etc.)
+      if (!msg) return res.status(200).json({ ok: true }); // puede ser un status update, ignoramos
 
       const from = msg.from;
       const type = msg.type;
 
-      // 1) Mensaje de TEXTO → disparar menú si dice "hola" o algo parecido, o información general por defecto
+      // 1) TEXTO: enviar siempre un texto de bienvenida + intentar el menú
       if (type === "text") {
-        const text = (msg.text?.body || "").trim().toLowerCase();
-        if (["hola", "menu", "buenas", "ir dental", "i-r dental"].some(k => text.includes(k))) {
-          await sendMainMenu(from);
-        } else {
-          // Respuesta por defecto + menú
-          await sendText(from, "¡Gracias por escribirnos! Te compartimos la información general y el menú:");
-          await sendMainMenu(from);
-        }
+        await sendText(from, `¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n${HOURS}\n\n${NO_TURNO}`);
+        await sendMainMenu(from); // si falla, al menos llegó el texto
       }
 
-      // 2) Respuesta INTERACTIVA (botón/lista)
+      // 2) INTERACTIVE (botones/lista)
       if (type === "interactive") {
         const inter = msg.interactive;
         const buttonReply = inter?.button_reply;
         const listReply = inter?.list_reply;
-
-        const selId = buttonReply?.id || listReply?.id;
+        const selId = buttonReply?.id || listReply?.id || "";
 
         switch (selId) {
           // Menú principal
@@ -228,41 +177,78 @@ export default async function handler(req, res) {
             break;
 
           case "MENU_SEDES":
+            // Podés usar sendSedesList(from) si ya está habilitado lo interactivo
             await sendSedesList(from);
             break;
 
           case "MENU_ESTUDIOS":
-            await sendText(from, TXT_ESTUDIOS);
+            await sendText(from, `🧾 Estudios i-R Dental:
+• Panorámica (OPG)
+• Cefalométrica (lateral/PA)
+• Periapicales
+• Oclusales
+• Serie completa
+• ATM básica
+• CBCT / Tomografía (si corresponde)
+• Fotografías intra/extraorales (si corresponde)
+
+✅ SIN TURNO, por orden de llegada.`);
             await sendMainMenu(from);
             break;
 
           case "MENU_OBRAS":
-            await sendText(from, TXT_OBRAS);
+            await sendText(from, `🧾 Obras sociales activas:
+• AMFFA
+• ANSSAL APDIS
+• APESA SALUD
+• CENTRO MEDICO PUEYRREDON
+• COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES
+• DASUTEN
+• DOCTHOS
+• ELEVAR*
+• ESPORA SALUD*
+• FATFA
+• FEMEBA AVELLANEDA
+• HOSPITAL BRITANICO
+• HOSPITAL ITALIANO
+• LUIS PASTEUR
+• MEDICUS*
+• NUBIAL
+• OMA
+• OMINT*
+• OSDE
+• OSDIPP
+• OSMEBA
+• OPSA
+• PODER JUDICIAL (en orden de Federación Odontológica)*
+• PROGRAMAS MEDICOS
+• QUALITAS
+• SANCOR SALUD*
+• SERVESALUD*
+• SETIA
+• SIMECO
+• SIND. MUNIC. AVELLANEDA
+• SWISS MEDICAL*
+
+(*) En la orden debe incluirse el Diagnóstico.
+
+⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`);
             await sendMainMenu(from);
             break;
 
           case "MENU_ENVIO":
-            await sendText(
-              from,
-              "📤 Para solicitar el envío de un estudio, por favor indicá:\n\n• Apellido y Nombre\n• DNI\n• Fecha de nacimiento\n• Estudio realizado\n• Sede (Quilmes / Avellaneda / Lomas)\n• Preferencia de envío (WhatsApp o Email — si es email, indicarlo)\n\nUn/a operador/a lo gestionará a la brevedad. 🙌"
-            );
+            await sendText(from, "📤 Para solicitar el envío de un estudio, por favor indicá:\n\n• Apellido y Nombre\n• DNI\n• Fecha de nacimiento\n• Estudio realizado\n• Sede (Quilmes / Avellaneda / Lomas)\n• Preferencia de envío (WhatsApp o Email — si es email, indicarlo)\n\nUn/a operador/a lo gestionará a la brevedad. 🙌");
             await sendMainMenu(from);
             break;
 
           case "MENU_SUBIR_ORDEN":
-            await sendText(
-              from,
-              "📎 Para subir tu orden, adjuntá una foto clara de la orden médica.\nUn/a operador/a te responderá con la confirmación y pasos a seguir."
-            );
+            await sendText(from, "📎 Para subir tu orden, adjuntá una foto clara de la orden médica.\nUn/a operador/a te responderá con la confirmación y pasos a seguir.");
             await sendMainMenu(from);
             break;
 
           case "MENU_OPERADOR":
-            await sendText(
-              from,
-              "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil."
-            );
-            // Acá podrías notificar a tu consola interna / ticketing si ya la tenés conectada.
+            await sendText(from, "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil.");
+            // (opcional) notificar a tu consola interna / Slack / email
             break;
 
           // Submenú sedes
@@ -280,7 +266,7 @@ export default async function handler(req, res) {
             break;
 
           default:
-            // Desconocido → devolver menú
+            await sendText(from, "Te envío el menú nuevamente:");
             await sendMainMenu(from);
             break;
         }
