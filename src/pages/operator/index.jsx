@@ -9,6 +9,7 @@ const DEFAULT_SECRET =
 function cls(...a) {
   return a.filter(Boolean).join(' ');
 }
+function withPlus(wa){ return wa?.startsWith('+') ? wa : `+${wa}` }
 
 export default function OperatorConsole() {
   const [secret, setSecret] = useState(DEFAULT_SECRET);
@@ -26,12 +27,16 @@ export default function OperatorConsole() {
     async function load() {
       try {
         const res = await fetch(`${API_BASE}/api/wsp/webhook?secret=${encodeURIComponent(secret)}`);
-        if (!res.ok) throw new Error('fetch chats failed');
+        if (!res.ok) {
+          const t = await res.text().catch(()=> '');
+          console.warn('fetch chats failed', res.status, t);
+          throw new Error('fetch chats failed');
+        }
         const data = await res.json();
         if (!alive) return;
         const list = Array.isArray(data.chats) ? data.chats : [];
         setChats(list);
-        if (!activeWa && list[0]?.wa) setActiveWa(list[0].wa);
+        if (!activeWa && list[0]?.wa) setActiveWa(withPlus(list[0].wa));
       } catch (_err) {
         // silent
       }
@@ -52,10 +57,14 @@ export default function OperatorConsole() {
       try {
         const res = await fetch(
           `${API_BASE}/api/wsp/webhook?secret=${encodeURIComponent(secret)}&wa=${encodeURIComponent(
-            activeWa
+            withPlus(activeWa)
           )}&limit=300`
         );
-        if (!res.ok) throw new Error('fetch messages failed');
+        if (!res.ok) {
+          const t = await res.text().catch(()=> '');
+          console.warn('fetch messages failed', res.status, t);
+          throw new Error('fetch messages failed');
+        }
         const data = await res.json();
         if (!alive) return;
         const list = Array.isArray(data.messages) ? data.messages : [];
@@ -94,7 +103,7 @@ export default function OperatorConsole() {
         body: JSON.stringify({
           op: 'send',
           secret,
-          wa: activeWa, // waKey (normalizado) — el server busca el wa_raw o hace fallback
+          wa: withPlus(activeWa), // waKey (normalizado) — el server busca el wa_raw o hace fallback
           text: outText.trim(),
         }),
       });
@@ -103,7 +112,7 @@ export default function OperatorConsole() {
         console.error('send failed', data);
       } else {
         setOutText('');
-        // No hace falta push optimista: el server ya persiste 'out' y lo veremos en el próximo poll
+        // No hace falta push optimista: el server ya persiste 'out' optimista y real
       }
     } catch (e) {
       console.error('send error', e);
@@ -198,19 +207,19 @@ export default function OperatorConsole() {
             {chats.map((c) => (
               <button
                 key={c.wa}
-                onClick={() => setActiveWa(c.wa)}
+                onClick={() => setActiveWa(withPlus(c.wa))}
                 className={cls('w-full', 'text-left')}
                 style={{
                   width: '100%',
                   textAlign: 'left',
                   padding: '12px 12px',
                   color: '#fff',
-                  background: activeWa === c.wa ? 'rgba(255,255,255,.1)' : 'transparent',
+                  background: activeWa === withPlus(c.wa) ? 'rgba(255,255,255,.1)' : 'transparent',
                   border: '0',
                   cursor: 'pointer',
                 }}
               >
-                <div style={{ fontSize: 14, fontWeight: 600 }}>{c.wa}</div>
+                <div style={{ fontSize: 14, fontWeight: 600 }}>{withPlus(c.wa)}</div>
                 <div style={{ fontSize: 12, color: 'rgba(255,255,255,.6)' }}>
                   {new Date(c.ts).toLocaleString()}
                 </div>
@@ -238,6 +247,11 @@ export default function OperatorConsole() {
             <div style={{ fontWeight: 600 }}>{activeWa || 'Seleccioná un chat'}</div>
           </div>
 
+          {/* mini debug opcional */}
+          <div style={{ padding: '4px 16px', color: 'rgba(255,255,255,.5)', fontSize: 11 }}>
+            consultando: {activeWa || '(sin wa)'}
+          </div>
+
           <div ref={scrollRef} style={{ flex: 1, overflow: 'auto', padding: 16, background: palette.negro }}>
             {messages.map((m) => (
               <div
@@ -256,7 +270,31 @@ export default function OperatorConsole() {
                 <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 6 }}>
                   {new Date(m.ts).toLocaleString()}
                 </div>
-                <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div>
+
+                {/* Texto principal */}
+                {m.text && (
+                  <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div>
+                )}
+
+                {/* Botones/lista como chips */}
+                {Array.isArray(m.buttons) && m.buttons.length > 0 && (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                    {m.buttons.map((b, i) => (
+                      <span
+                        key={i}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 999,
+                          background: 'rgba(0,0,0,.25)',
+                          border: '1px solid rgba(255,255,255,.25)',
+                          fontSize: 12,
+                        }}
+                      >
+                        {b}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
             {messages.length === 0 && <div style={{ color: 'rgba(255,255,255,.6)' }}>No hay mensajes para este chat.</div>}
