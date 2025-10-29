@@ -1,11 +1,13 @@
 // ==============================================
 // File: src/pages/api/wsp/webhook.js
-// Purpose: WhatsApp webhook + Operator feed (GET)
+// Purpose: WhatsApp webhook + Operator feed (GET) + Operator SEND (POST)
 // Notes:
 //  - Redis sessions (Upstash) + FLOW_* logs
 //  - Idempotencia por message.id
 //  - Historial para consola y endpoint GET
 //  - Envío SIEMPRE a wa_id crudo (AR 549...), storage con wa normalizado
+//  - Compat Upstash v1: zrange({rev:true, withScores:true}) + polyfill zrevrange
+//  - POST de operador: {op:"send", secret, wa, text}  → envía y persiste 'out'
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -23,33 +25,26 @@ const {
   TEST_RECIPIENT_FORMAT = 'no9', // 'no9' | 'with9' | ''
 } = process.env
 
-
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
 
-// --- Upstash v1 compat shim: si no existe zrevrange, lo mapeamos a zrange con rev:true
+// Compat shim: si no existe zrevrange en esta versión, mapear a zrange con rev:true
 if (typeof redis.zrevrange !== 'function') {
   redis.zrevrange = async (key, start, stop, opts = {}) => {
-    // Upstash v1 acepta { withScores: true } y también puede devolver
-    // formato objeto [{member, score}] o alternado ['member','score',...]
     return await redis.zrange(key, start, stop, { ...opts, rev: true })
   }
 }
 
-const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
-
-let items
-if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object') {
-  items = rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
-} else {
-  items = []
-  for (let i = 0; i < rows.length; i += 2) {
-    items.push({ wa: rows[i], ts: Number(rows[i + 1]) })
-  }
-}
-return res.status(200).json({ chats: items })
+// --- Keys ---
+const kSess    = (wa) => `sess:${wa}`
+const kMsgs    = (wa) => `chat:${wa}:messages`
+const kSeen    = (wa) => `seen:${wa}`
+const kChats   = 'chats:index'
+const kWaRaw   = (wa) => `waid:${wa}` // último wa_id crudo visto para ese waKey
 
 // --- Helpers ---
-function flowLog(tag, obj) { console.log(`FLOW_${tag} →`, typeof obj === 'string' ? obj : JSON.stringify(obj)) }
+function flowLog(tag, obj) {
+  console.log(`FLOW_${tag} →`, typeof obj === 'string' ? obj : JSON.stringify(obj))
+}
 
 async function readBody(req) {
   const chunks = []
@@ -58,8 +53,6 @@ async function readBody(req) {
   const raw = buf.toString('utf8') || '{}'
   try { return { raw, json: JSON.parse(raw) } } catch { return { raw, json: {} } }
 }
-
-function toRawFromWaKey(waKey){ return (waKey||'').replace(/^\+/, '') }
 
 function normalizeWaId(waId) {
   let id = waId
@@ -73,11 +66,16 @@ function normalizeWaId(waId) {
   return id
 }
 
-// Redis keys
-const kSess  = (wa) => `sess:${wa}`
-const kMsgs  = (wa) => `chat:${wa}:messages`
-const kSeen  = (wa) => `seen:${wa}`
-const kChats = 'chats:index'
+function waKeyToRawDigitsFallback(waKey) {
+  // Intento simple: quitar '+' y, si es AR sin 9, forzar 549
+  // ej: +5411... → 54911... (móvil) / si ya tiene 549, queda igual
+  const digits = (waKey || '').replace(/^\+/, '')
+  if (digits.startsWith('549')) return digits
+  if (digits.startsWith('54') && !digits.startsWith('549')) {
+    return `549${digits.slice(2)}`
+  }
+  return digits
+}
 
 // JSON-safe session helpers
 async function getSession(waKey) {
@@ -111,18 +109,24 @@ async function alreadyProcessed(waKey, messageId) {
 async function sendText(toRawDigits, body, storeKey) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
-    return null
+    return { ok: false, status: 500, data: { error: 'Missing env' } }
   }
   const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`
   const payload = { messaging_product: 'whatsapp', to: String(toRawDigits), text: { body } }
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WHATSAPP_TOKEN}` }, body: JSON.stringify(payload) })
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    body: JSON.stringify(payload),
+  })
   let data = {}
   try { data = await res.json() } catch {}
   flowLog('SEND_TEXT', { to: toRawDigits, body, status: res.status, data })
-  try{
+  try {
     const outId = data?.messages?.[0]?.id || `out-${Date.now()}`
-    if(storeKey){ await appendMessage(storeKey, { id: outId, from: storeKey, direction: 'out', text: body, ts: Date.now() }) }
-  }catch{}
+    if (storeKey) {
+      await appendMessage(storeKey, { id: outId, from: storeKey, direction: 'out', text: body, ts: Date.now() })
+    }
+  } catch {}
   return { ok: res.ok, status: res.status, data }
 }
 
@@ -203,12 +207,14 @@ async function routeIncomingMessage(waRaw, waKey, msg) {
 export default async function handler(req, res) {
   // GET: webhook verify OR operator feed
   if (req.method === 'GET') {
+    // 1) Verificación de Meta
     const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } = req.query || {}
     if (mode === 'subscribe') {
       if (token === WSP_VERIFY_TOKEN) { flowLog('VERIFY_OK', { mode }); return res.status(200).send(challenge) }
       flowLog('VERIFY_FAIL', { mode }); return res.status(403).send('Forbidden')
     }
 
+    // 2) Feed para consola
     const { secret, wa, limit = '100' } = req.query || {}
     if (secret !== OPERATOR_SECRET) return res.status(401).json({ error: 'unauthorized' })
 
@@ -233,14 +239,32 @@ export default async function handler(req, res) {
     return res.status(200).json({ chats: items })
   }
 
-  // POST: WhatsApp webhook events
+  // POST: WhatsApp webhook events  **o** Operator send
   if (req.method === 'POST') {
     const { raw, json } = await readBody(req)
+
+    // ---- Rama operador: { op:"send", secret, wa, text }
+    if (json?.op === 'send') {
+      const { secret, wa, text } = json || {}
+      if (secret !== OPERATOR_SECRET) return res.status(401).json({ error: 'unauthorized' })
+      if (!wa || !text) return res.status(400).json({ error: 'wa and text required' })
+
+      // Buscar wa_id crudo guardado; si no hay, usar fallback desde waKey
+      let waRaw = await redis.get(kWaRaw(wa))
+      if (!waRaw) waRaw = waKeyToRawDigitsFallback(wa)
+
+      flowLog('OPERATOR_SEND_REQ', { waKey: wa, waRaw, text })
+      const r = await sendText(waRaw, text, wa)
+      flowLog('OPERATOR_SEND_RES', r)
+      return res.status(r.ok ? 200 : 500).json(r)
+    }
+
+    // ---- Rama WhatsApp webhook (Meta)
     flowLog('WEBHOOK_BODY', raw)
 
-    const entry = json?.entry?.[0]
+    const entry  = json?.entry?.[0]
     const change = entry?.changes?.[0]
-    const value = change?.value
+    const value  = change?.value
 
     if (!value) { flowLog('NO_VALUE', json); return res.status(200).json({ ok: true }) }
 
@@ -248,11 +272,14 @@ export default async function handler(req, res) {
       flowLog('STATUSES', value.statuses); return res.status(200).json({ ok: true })
     }
 
-    const waIdRaw = value?.contacts?.[0]?.wa_id           // crudo para enviar (549...)
-    const waKey   = normalizeWaId(waIdRaw)                // normalizado para guardar
+    const waIdRaw = value?.contacts?.[0]?.wa_id     // crudo para enviar (549...)
+    const waKey   = normalizeWaId(waIdRaw)          // normalizado para guardar
 
     const msg = value?.messages?.[0]
     if (!waKey || !msg) { flowLog('MISSING_MSG', { wa: waIdRaw, hasMsg: !!msg }); return res.status(200).json({ ok: true }) }
+
+    // Guardar el último waRaw visto para ese waKey (lo usa el operador)
+    if (waIdRaw) await redis.set(kWaRaw(waKey), waIdRaw)
 
     if (await alreadyProcessed(waKey, msg.id)) { flowLog('DUPLICATE', { wa: waKey, id: msg.id }); return res.status(200).json({ ok: true }) }
 

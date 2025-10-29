@@ -16,6 +16,8 @@ export default function OperatorConsole() {
   const [activeWa, setActiveWa] = useState(null);
   const [messages, setMessages] = useState([]);
   const [pollMs, setPollMs] = useState(2000);
+  const [outText, setOutText] = useState('');
+  const [sending, setSending] = useState(false);
   const scrollRef = useRef(null);
 
   // Poll chats
@@ -57,9 +59,9 @@ export default function OperatorConsole() {
         const data = await res.json();
         if (!alive) return;
         const list = Array.isArray(data.messages) ? data.messages : [];
-        // build stable keys to avoid flicker
+        // claves estables para evitar flicker
         const keyed = list.map((m, i) => ({ ...m, _key: m.id || `${String(m.ts || 0)}-${i}` }));
-        // merge with previous state, then sort by ts
+        // merge incremental (no reemplazar array completo) + ordenar por ts
         setMessages((prev) => {
           const map = new Map();
           for (const m of prev) map.set(m._key, m);
@@ -81,6 +83,41 @@ export default function OperatorConsole() {
       clearInterval(id);
     };
   }, [secret, activeWa, pollMs]);
+
+  async function sendOutgoing() {
+    if (!activeWa || !outText.trim() || sending) return;
+    setSending(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/wsp/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          op: 'send',
+          secret,
+          wa: activeWa, // waKey (normalizado) — el server busca el wa_raw o hace fallback
+          text: outText.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error('send failed', data);
+      } else {
+        setOutText('');
+        // No hace falta push optimista: el server ya persiste 'out' y lo veremos en el próximo poll
+      }
+    } catch (e) {
+      console.error('send error', e);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function onEnter(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendOutgoing();
+    }
+  }
 
   const palette = {
     bordo: '#6b0f1a',
@@ -225,16 +262,47 @@ export default function OperatorConsole() {
             {messages.length === 0 && <div style={{ color: 'rgba(255,255,255,.6)' }}>No hay mensajes para este chat.</div>}
           </div>
 
+          {/* Input de salida */}
           <div
             style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 120px',
+              gap: 8,
               padding: '10px 16px',
               borderTop: '1px solid #1f1f22',
               background: palette.gris,
-              color: 'rgba(255,255,255,.8)',
-              fontSize: 12,
             }}
           >
-            • Mensajes ordenados por timestamp y desduplicados por clave estable.
+            <textarea
+              value={outText}
+              onChange={(e) => setOutText(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder={activeWa ? `Mensaje a ${activeWa}` : 'Seleccioná un chat'}
+              rows={2}
+              style={{
+                resize: 'none',
+                padding: '10px 12px',
+                borderRadius: 10,
+                background: '#111',
+                color: '#fff',
+                border: '1px solid rgba(255,255,255,.15)',
+                outline: 'none',
+              }}
+            />
+            <button
+              onClick={sendOutgoing}
+              disabled={!activeWa || !outText.trim() || sending}
+              style={{
+                border: 0,
+                borderRadius: 10,
+                background: sending ? 'rgba(193,18,31,.5)' : '#c1121f',
+                color: '#fff',
+                fontWeight: 600,
+                cursor: !activeWa || !outText.trim() || sending ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {sending ? 'Enviando…' : 'Enviar'}
+            </button>
           </div>
         </section>
       </main>
