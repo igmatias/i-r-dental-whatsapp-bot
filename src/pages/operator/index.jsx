@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-const API_BASE = process.env.NEXT_PUBLIC_OPERATOR_BASE || '';
+const API_BASE = process.env.NEXT_PUBLIC_OPERATOR_BASE || ''; // same origin
 const DEFAULT_SECRET =
   typeof window !== 'undefined'
     ? new URLSearchParams(window.location.search).get('secret') || 'irdental2025'
@@ -45,7 +45,7 @@ export default function OperatorConsole() {
     return () => { alive=false; clearInterval(id); };
   }, [secret, pollMs, activeWa]);
 
-  // Poll messages
+  // Poll messages (lista directa, ordenada por ts)
   useEffect(() => {
     if (!activeWa) return;
     let alive = true;
@@ -56,7 +56,6 @@ export default function OperatorConsole() {
         const data = await res.json();
         if (!alive) return;
         const list = (Array.isArray(data?.messages) ? data.messages : []).slice().sort((a,b)=>(a.ts||0)-(b.ts||0));
-        // **FIX**: seteamos lista directa (evitar claves duplicadas que dejaban array vacío)
         setMessages(list.map((m,i)=>({ ...m, _key: m.id || `${String(m.ts||0)}-${i}` })));
         requestAnimationFrame(() => { if (scrollRef.current) scrollRef.current.scrollTo({ top: 1e9, behavior: 'smooth' }); });
       } catch {}
