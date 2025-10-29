@@ -12,6 +12,7 @@ export default async function handler(req, res) {
     if (!STORE?.getThread) return res.status(200).json({ ok: true, messages: [] });
 
     const messages = STORE.getThread(waFrom);
+    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ ok: true, messages });
   } catch (e) {
     console.error("OPERATOR THREAD ERROR:", e);

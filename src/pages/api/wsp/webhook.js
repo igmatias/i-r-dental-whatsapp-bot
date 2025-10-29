@@ -4,7 +4,7 @@ import {
   getSession as rGet,
   setSession as rSet,
   delSession as rDel,
-} from "../../../lib/session"; // ← sesiones Redis (TTL)
+} from "../../../lib/session";
 
 const STORE = getStore();
 const API_URL = (phoneId) => `https://graph.facebook.com/v20.0/${phoneId}/messages`;
@@ -69,33 +69,22 @@ AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANO
 
 ⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`;
 
-/** ========= NORMALIZACIÓN AR (test) =========
- * TEST_RECIPIENT_FORMAT: "no9" | "with9" (opcional para pruebas)
- */
+/** ========= NORMALIZACIÓN AR (test) ========= */
 function toE164ArForTesting(raw) {
   let n = (raw || "").trim();
   if (!n.startsWith("+")) n = "+" + n;
-
   const mode = (process.env.TEST_RECIPIENT_FORMAT || "").toLowerCase();
-  if (mode === "no9" && /^\+54911\d{8}$/.test(n)) {
-    const fixed = n.replace(/^\+54911/, "+5411");
-    console.log("NORMALIZED(no9):", n, "→", fixed);
-    n = fixed;
-  }
-  if (mode === "with9" && /^\+5411\d{8}$/.test(n)) {
-    const fixed = n.replace(/^\+5411/, "+54911");
-    console.log("NORMALIZED(with9):", n, "→", fixed);
-    n = fixed;
-  }
+  if (mode === "no9" && /^\+54911\d{8}$/.test(n)) n = n.replace(/^\+54911/, "+5411");
+  if (mode === "with9" && /^\+5411\d{8}$/.test(n)) n = n.replace(/^\+5411/, "+54911");
   return n;
 }
 
-/** ========= HELPERS ENVÍO MENSAJES ========= **/
-async function sendJson(to, payload) {
+/** ========= HELPERS ENVÍO MENSAJES (con reintentos) ========= **/
+async function sendJson(to, payload, attempt = 1) {
   try {
-    console.log("USING PHONE_ID:", process.env.WHATSAPP_PHONE_ID, "SENDING TO:", to);
     const r = await fetch(API_URL(process.env.WHATSAPP_PHONE_ID), {
       method: "POST",
+      cache: "no-store",
       headers: {
         Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
         "Content-Type": "application/json",
@@ -106,12 +95,24 @@ async function sendJson(to, payload) {
         ...payload,
       }),
     });
-    const data = await r.json();
-    if (!r.ok) console.error("SEND ERROR", r.status, JSON.stringify(data));
-    else console.log("MESSAGE SENT →", to);
+    const data = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+      console.error("SEND ERROR", r.status, JSON.stringify(data));
+      if ((r.status === 429 || r.status >= 500) && attempt < 3) {
+        await new Promise(res => setTimeout(res, 300 * attempt));
+        return sendJson(to, payload, attempt + 1);
+      }
+    } else {
+      console.log("MESSAGE SENT →", to, payload.type);
+    }
     return { ok: r.ok, status: r.status, data };
   } catch (e) {
     console.error("SEND THROW", e);
+    if (attempt < 3) {
+      await new Promise(res => setTimeout(res, 300 * attempt));
+      return sendJson(to, payload, attempt + 1);
+    }
     return { ok: false, status: 0, data: { error: String(e) } };
   }
 }
@@ -460,7 +461,7 @@ export default async function handler(req, res) {
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // Log entrante básico
+      // Log entrante
       if (type === "text") {
         const bodyIn = msg.text?.body || "";
         safePush({
@@ -491,14 +492,12 @@ export default async function handler(req, res) {
 
       if (type === "text") {
         if (flow) {
+          console.log("FLOW_TEXT_STEP →", from, flow.step);
           const consumed = await handleEnvioText(from, msg.text?.body || "");
           if (consumed) return res.status(200).json({ ok: true });
-          // Si por alguna razón no consumió, seguí al prompt actual:
           await promptNext(from);
           return res.status(200).json({ ok: true });
         }
-
-        // Texto sin flujo → bienvenida + menú
         await sendText(from, TXT_BIENVENIDA);
         await sendMainMenuButtons(from);
         return res.status(200).json({ ok: true });
@@ -510,11 +509,11 @@ export default async function handler(req, res) {
         const selId = buttonReply?.id || "";
 
         if (flow) {
+          console.log("FLOW_BTN_STEP →", from, flow.step, selId);
           const consumed = await handleEnvioButton(from, selId);
           if (consumed) return res.status(200).json({ ok: true });
         }
 
-        // --- Menú principal / submenús ---
         switch (selId) {
           case "MENU_SEDES":
             await sendSedesButtons(from);
@@ -539,10 +538,11 @@ export default async function handler(req, res) {
             break;
 
           case "MENU_ENVIO":
+            console.log("FLOW_START →", from);
             await startEnvioFlow(from);
             await sendText(from, "Vamos a tomar los datos para enviarte el estudio. Podés escribir **cancelar** en cualquier momento.");
             await promptNext(from); // pide APELLIDO
-            break;
+            return res.status(200).json({ ok: true });
 
           case "MENU_SUBIR_ORDEN":
             await sendText(

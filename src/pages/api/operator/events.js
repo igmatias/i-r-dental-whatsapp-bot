@@ -10,6 +10,7 @@ export default async function handler(req, res) {
 
     const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
     const threads = STORE.listThreads(limit);
+    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ ok: true, threads });
   } catch (e) {
     console.error("OPERATOR EVENTS ERROR:", e);
