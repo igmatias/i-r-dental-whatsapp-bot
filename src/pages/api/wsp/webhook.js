@@ -2,7 +2,7 @@
 
 const API_URL = (phoneId) => `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
-// ======== TEXTOS =========
+/** ========= TEXTOS BASE ========= **/
 const HOURS = `🕒 Horarios (todas las sedes)
 • Lunes a viernes: 09:00 a 17:30
 • Sábados: 09:00 a 12:30`;
@@ -62,8 +62,9 @@ AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANO
 
 ⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`;
 
-// ======== NORMALIZACIÓN (solo pruebas) =========
-// TEST_RECIPIENT_FORMAT en Vercel: "no9" | "with9"
+/** ========= NORMALIZACIÓN AR (pruebas) =========
+ * TEST_RECIPIENT_FORMAT en Vercel: "no9" | "with9"
+ */
 function toE164ArForTesting(raw) {
   let n = (raw || "").trim();
   if (!n.startsWith("+")) n = "+" + n; // asegurar "+"
@@ -82,7 +83,7 @@ function toE164ArForTesting(raw) {
   return n;
 }
 
-// ======== HELPERS =========
+/** ========= HELPERS ENVÍO MENSAJES ========= **/
 async function sendJson(to, payload) {
   try {
     console.log("USING PHONE_ID:", process.env.WHATSAPP_PHONE_ID, "SENDING TO:", to);
@@ -113,7 +114,7 @@ async function sendJson(to, payload) {
 
 const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
 
-// Botones: máx 3 por mensaje (límite WhatsApp)
+// Botones (máx 3)
 async function sendButtons(to, body, buttons = []) {
   const btns = buttons.slice(0, 3).map((b) => ({
     type: "reply",
@@ -123,13 +124,13 @@ async function sendButtons(to, body, buttons = []) {
     type: "interactive",
     interactive: {
       type: "button",
-      body: { text: body }, // sin 'type'
+      body: { text: body },
       action: { buttons: btns },
     },
   });
 }
 
-// Menú principal con botones (dos tandas para cubrir todo)
+// Menú principal (botones, dos tandas)
 async function sendMainMenuButtons(to) {
   await sendButtons(to, "Menú (1/2): elegí una opción", [
     { id: "MENU_SEDES",    title: "📍 Sedes" },
@@ -165,7 +166,281 @@ ${HOURS}
 ${NO_TURNO}`;
 }
 
-// ======== HANDLER =========
+/** ========= FSM "ENVÍO DE ESTUDIO" =========
+ * Guardamos estado en memoria (MVP). En Vercel serverless puede resetearse;
+ * para producción conviene KV/DB. Para pruebas funciona bien.
+ */
+const SESSIONS = new Map(); // key: from, value: { step, data, startedAt }
+
+const FLOW_STEPS = [
+  "APELLIDO",
+  "NOMBRE",
+  "DNI",
+  "FECHA_NAC",
+  "ESTUDIO",
+  "SEDE",
+  "VIA",
+  "EMAIL_IF_NEEDED",
+  "CONFIRM",
+];
+
+function startEnvioFlow(from) {
+  SESSIONS.set(from, {
+    step: "APELLIDO",
+    data: {
+      apellido: "",
+      nombre: "",
+      dni: "",
+      fechaNac: "",
+      estudio: "",
+      sede: "",
+      via: "",
+      email: "",
+    },
+    startedAt: Date.now(),
+  });
+}
+
+function endEnvioFlow(from) {
+  SESSIONS.delete(from);
+}
+
+function getSession(from) {
+  return SESSIONS.get(from);
+}
+
+// Validaciones básicas
+function isValidDni(s) {
+  return /^[0-9]{6,9}$/.test((s || "").replace(/\D/g, ""));
+}
+function normalizeDate(s) {
+  // acepta DD/MM/AAAA o AAAA-MM-DD y devuelve AAAA-MM-DD si se puede
+  const t = (s || "").trim();
+  const ddmmyyyy = /^([0-3]?\d)\/([01]?\d)\/(\d{4})$/;
+  const yyyymmdd = /^(\d{4})-(\d{2})-(\d{2})$/;
+  if (ddmmyyyy.test(t)) {
+    const [, d, m, y] = t.match(ddmmyyyy);
+    const dd = String(d).padStart(2, "0");
+    const mm = String(m).padStart(2, "0");
+    return `${y}-${mm}-${dd}`;
+  }
+  if (yyyymmdd.test(t)) return t;
+  return null;
+}
+function isValidEmail(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((s || "").trim());
+}
+
+function resumenEnvio(d) {
+  return `📝 Solicitud de envío de estudio
+
+Paciente: ${d.apellido}, ${d.nombre}
+DNI: ${d.dni}
+Fecha de nacimiento: ${d.fechaNac}
+Estudio: ${d.estudio}
+Sede: ${d.sede}
+Envío por: ${d.via}${d.via === "Email" ? ` (${d.email})` : ""}`;
+}
+
+// Notificación al operador (opcional)
+async function notifyOperator(d) {
+  const opTo = (process.env.OPERATOR_WA_TO || "").trim();
+  if (!opTo) return { ok: true }; // no configurado, solo salimos
+  const body = `📬 Nuevo pedido de envío de estudio
+
+${resumenEnvio(d)}
+
+Por favor solicitar el archivo a radiología y enviarlo al paciente.`;
+  return sendText(opTo, body);
+}
+
+// Render de siguiente paso
+async function promptNext(from) {
+  const s = getSession(from);
+  if (!s) return;
+
+  switch (s.step) {
+    case "APELLIDO":
+      await sendText(from, "✍️ Ingresá el **apellido** del paciente:");
+      break;
+    case "NOMBRE":
+      await sendText(from, "Ahora ingresá el **nombre** del paciente:");
+      break;
+    case "DNI":
+      await sendText(from, "Ingresá el **DNI** (solo números):");
+      break;
+    case "FECHA_NAC":
+      await sendText(from, "Ingresá la **fecha de nacimiento** (DD/MM/AAAA o AAAA-MM-DD):");
+      break;
+    case "ESTUDIO":
+      await sendText(from, "¿Qué **estudio** se realizó? (ej.: Panorámica OPG)");
+      break;
+    case "SEDE":
+      await sendButtons(from, "Elegí la **sede** donde se realizó:", [
+        { id: "EV_SEDE_QUILMES", title: "Quilmes" },
+        { id: "EV_SEDE_AVELL",   title: "Avellaneda" },
+        { id: "EV_SEDE_LOMAS",   title: "Lomas" },
+      ]);
+      break;
+    case "VIA":
+      await sendButtons(from, "¿Por dónde querés recibirlo?", [
+        { id: "EV_VIA_WSP",   title: "WhatsApp" },
+        { id: "EV_VIA_EMAIL", title: "Email" },
+        { id: "BTN_CANCEL_ENVIO", title: "Cancelar" },
+      ]);
+      break;
+    case "EMAIL_IF_NEEDED":
+      await sendText(from, "📧 Ingresá el **email** para el envío:");
+      break;
+    case "CONFIRM": {
+      const t = resumenEnvio(s.data) + "\n\n¿Confirmás el envío?";
+      await sendButtons(from, t, [
+        { id: "EV_CONFIRM_YES", title: "✅ Confirmar" },
+        { id: "EV_CONFIRM_NO",  title: "❌ Cancelar" },
+      ]);
+      break;
+    }
+  }
+}
+
+// Manejo de respuestas dentro del flujo
+async function handleEnvioText(from, rawBody) {
+  const s = getSession(from);
+  if (!s) return false;
+
+  const body = (rawBody || "").trim();
+
+  if (/^(cancelar|salir|menu|menú)$/i.test(body)) {
+    endEnvioFlow(from);
+    await sendText(from, "Se canceló la solicitud. Te dejo el menú:");
+    await sendMainMenuButtons(from);
+    return true;
+  }
+
+  switch (s.step) {
+    case "APELLIDO":
+      s.data.apellido = body.toUpperCase();
+      s.step = "NOMBRE";
+      await promptNext(from);
+      return true;
+
+    case "NOMBRE":
+      s.data.nombre = body.toUpperCase();
+      s.step = "DNI";
+      await promptNext(from);
+      return true;
+
+    case "DNI": {
+      const digits = body.replace(/\D/g, "");
+      if (!isValidDni(digits)) {
+        await sendText(from, "El DNI no parece válido. Escribilo solo con números (6 a 9 dígitos).");
+        return true;
+      }
+      s.data.dni = digits;
+      s.step = "FECHA_NAC";
+      await promptNext(from);
+      return true;
+    }
+
+    case "FECHA_NAC": {
+      const norm = normalizeDate(body);
+      if (!norm) {
+        await sendText(from, "Formato de fecha no válido. Usá **DD/MM/AAAA** o **AAAA-MM-DD**.");
+        return true;
+      }
+      s.data.fechaNac = norm;
+      s.step = "ESTUDIO";
+      await promptNext(from);
+      return true;
+    }
+
+    case "ESTUDIO":
+      s.data.estudio = body;
+      s.step = "SEDE";
+      await promptNext(from);
+      return true;
+
+    case "EMAIL_IF_NEEDED":
+      if (!isValidEmail(body)) {
+        await sendText(from, "Ese email no parece válido. Probá de nuevo (ej.: nombre@dominio.com).");
+        return true;
+      }
+      s.data.email = body.trim();
+      s.step = "CONFIRM";
+      await promptNext(from);
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+async function handleEnvioButton(from, btnId) {
+  const s = getSession(from);
+  if (!s) return false;
+
+  if (btnId === "BTN_CANCEL_ENVIO") {
+    endEnvioFlow(from);
+    await sendText(from, "Se canceló la solicitud. Te dejo el menú:");
+    await sendMainMenuButtons(from);
+    return true;
+  }
+
+  switch (s.step) {
+    case "SEDE":
+      if (btnId === "EV_SEDE_QUILMES") s.data.sede = "Quilmes";
+      else if (btnId === "EV_SEDE_AVELL") s.data.sede = "Avellaneda";
+      else if (btnId === "EV_SEDE_LOMAS") s.data.sede = "Lomas de Zamora";
+      else {
+        await sendText(from, "Elegí una sede de los botones, por favor.");
+        return true;
+      }
+      s.step = "VIA";
+      await promptNext(from);
+      return true;
+
+    case "VIA":
+      if (btnId === "EV_VIA_WSP") {
+        s.data.via = "WhatsApp";
+        s.step = "CONFIRM";
+        await promptNext(from);
+        return true;
+      }
+      if (btnId === "EV_VIA_EMAIL") {
+        s.data.via = "Email";
+        s.step = "EMAIL_IF_NEEDED";
+        await promptNext(from);
+        return true;
+      }
+      await sendText(from, "Elegí una opción de los botones, por favor.");
+      return true;
+
+    case "CONFIRM":
+      if (btnId === "EV_CONFIRM_YES") {
+        // Notificar operador y cerrar
+        await notifyOperator(s.data);
+        await sendText(from, "✅ Recibimos tu solicitud. Un/a operador/a la gestionará a la brevedad.");
+        endEnvioFlow(from);
+        await sendButtons(from, "¿Querés volver al menú o hablar con un operador?", [
+          { id: "BTN_BACK_MENU", title: "↩️ Menú" },
+          { id: "MENU_OPERADOR", title: "👤 Operador" },
+        ]);
+        return true;
+      }
+      if (btnId === "EV_CONFIRM_NO") {
+        endEnvioFlow(from);
+        await sendText(from, "Solicitud cancelada. Te dejo el menú:");
+        await sendMainMenuButtons(from);
+        return true;
+      }
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+/** ========= HANDLER ========= **/
 export default async function handler(req, res) {
   // GET: verificación del webhook
   if (req.method === "GET") {
@@ -185,25 +460,36 @@ export default async function handler(req, res) {
       console.log("WEBHOOK BODY:", JSON.stringify(body));
 
       const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      if (!msg) return res.status(200).json({ ok: true }); // puede ser status update
+      if (!msg) return res.status(200).json({ ok: true });
 
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // 1) TEXTO: bienvenida + botones (SIN lista, para evitar bloqueos)
+      /** --- Si hay flujo de envío activo, interceptamos primero --- **/
+      if (type === "text" && getSession(from)) {
+        const consumed = await handleEnvioText(from, msg.text?.body || "");
+        if (consumed) return res.status(200).json({ ok: true });
+      }
+      if (type === "interactive" && getSession(from)) {
+        const btnId = msg?.interactive?.button_reply?.id || msg?.interactive?.list_reply?.id || "";
+        const consumed = await handleEnvioButton(from, btnId);
+        if (consumed) return res.status(200).json({ ok: true });
+      }
+
+      /** --- Flujo normal (menú) --- **/
       if (type === "text") {
         await sendText(from, TXT_BIENVENIDA);
         await sendMainMenuButtons(from);
+        return res.status(200).json({ ok: true });
       }
 
-      // 2) INTERACTIVE (botones)
       if (type === "interactive") {
         const inter = msg.interactive;
         const buttonReply = inter?.button_reply;
         const selId = buttonReply?.id || "";
 
         switch (selId) {
-          // ===== Menú principal =====
+          /** Menú principal **/
           case "MENU_SEDES":
             await sendSedesButtons(from);
             break;
@@ -227,18 +513,9 @@ export default async function handler(req, res) {
             break;
 
           case "MENU_ENVIO":
-            await sendText(
-              from,
-              "📤 Para solicitar el envío de un estudio, por favor indicá:\n\n" +
-              "• Apellido y Nombre\n• DNI\n• Fecha de nacimiento\n• Estudio realizado\n• Sede (Quilmes / Avellaneda / Lomas)\n" +
-              "• Preferencia de envío (WhatsApp o Email — si es email, indicarlo)\n\n" +
-              "Un/a operador/a lo gestionará a la brevedad. 🙌"
-            );
-            await sendButtons(from, "¿Querés volver al menú?", [
-              { id: "BTN_BACK_MENU",   title: "↩️ Menú" },
-              { id: "MENU_OPERADOR",   title: "👤 Operador" },
-              { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
-            ]);
+            startEnvioFlow(from);
+            await sendText(from, "Vamos a tomar los datos para enviarte el estudio. Podés escribir **cancelar** en cualquier momento.");
+            await promptNext(from); // pide APELLIDO
             break;
 
           case "MENU_SUBIR_ORDEN":
@@ -258,7 +535,7 @@ export default async function handler(req, res) {
             await sendText(from, "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil.");
             break;
 
-          // ===== Submenú sedes =====
+          /** Submenú sedes **/
           case "SEDE_QUILMES":
             await sendText(from, sedeInfo("QUILMES"));
             await sendButtons(from, "¿Querés otra opción?", [
@@ -286,7 +563,7 @@ export default async function handler(req, res) {
             ]);
             break;
 
-          // ===== Volver al menú =====
+          /** Volver al menú **/
           case "BTN_BACK_MENU":
             await sendMainMenuButtons(from);
             break;
@@ -296,6 +573,8 @@ export default async function handler(req, res) {
             await sendMainMenuButtons(from);
             break;
         }
+
+        return res.status(200).json({ ok: true });
       }
 
       return res.status(200).json({ ok: true });
