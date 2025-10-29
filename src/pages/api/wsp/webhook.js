@@ -43,18 +43,28 @@ const TXT_BIENVENIDA =
   `${HOURS}\n\n${NO_TURNO}\n\n` +
   "Elegí una opción del menú para continuar.";
 
-// ======== HELPERS =========
-function normalizeArgentinaNumber(num) {
-  // Si el número tiene +54911, lo reemplazamos por +5411
-  if (num.startsWith("+54911")) {
-    const fixed = num.replace("+54911", "+5411");
-    console.log("NORMALIZED:", num, "→", fixed);
+// ======== NORMALIZACIÓN (solo para pruebas) =========
+// Usa TEST_RECIPIENT_FORMAT en Vercel (no9 | with9) si tu número de prueba fue cargado distinto.
+function normalizeArgentinaNumberForTesting(num) {
+  const mode = (process.env.TEST_RECIPIENT_FORMAT || "").toLowerCase();
+  if (mode === "no9" && /^\+54911\d{8}$/.test(num)) {
+    const fixed = num.replace(/^\+54911/, "+5411");
+    console.log("NORMALIZED(no9):", num, "→", fixed);
+    return fixed;
+  }
+  if (mode === "with9" && /^\+5411\d{8}$/.test(num)) {
+    const fixed = num.replace(/^\+5411/, "+54911");
+    console.log("NORMALIZED(with9):", num, "→", fixed);
     return fixed;
   }
   return num;
 }
 
+// ======== HELPERS =========
 async function sendJson(to, payload) {
+  // Log para diagnosticar 131030 (App/PhoneID/allowed list)
+  console.log("USING PHONE_ID:", process.env.WHATSAPP_PHONE_ID, "SENDING TO:", to);
+
   const r = await fetch(API_URL(process.env.WHATSAPP_PHONE_ID), {
     method: "POST",
     headers: {
@@ -76,13 +86,14 @@ async function sendJson(to, payload) {
 const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
 
 async function sendMainMenu(to) {
+  // Lista interactiva (body/footer sin 'type')
   return sendJson(to, {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "i-R Dental" },
-      body: { text: TXT_BIENVENIDA },
-      footer: { text: "Seleccioná una opción" },
+      header: { type: "text", text: "i-R Dental" }, // header sí admite 'type'
+      body: { text: TXT_BIENVENIDA },               // ✅ sin 'type'
+      footer: { text: "Seleccioná una opción" },    // ✅ sin 'type'
       action: {
         button: "Abrir menú",
         sections: [
@@ -110,7 +121,7 @@ async function sendSedesList(to) {
     interactive: {
       type: "list",
       header: { type: "text", text: "Sedes i-R Dental" },
-      body: { text: "Elegí una sede para ver dirección, contacto y cómo llegar." },
+      body: { text: "Elegí una sede para ver dirección, contacto y cómo llegar." }, // ✅ sin 'type'
       action: {
         button: "Elegir sede",
         sections: [
@@ -143,6 +154,7 @@ ${NO_TURNO}`;
 
 // ======== HANDLER =========
 export default async function handler(req, res) {
+  // GET: verificación del webhook
   if (req.method === "GET") {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
@@ -153,25 +165,27 @@ export default async function handler(req, res) {
     return res.status(403).send("Forbidden");
   }
 
+  // POST: eventos entrantes
   if (req.method === "POST") {
     try {
       const body = req.body;
       console.log("WEBHOOK BODY:", JSON.stringify(body));
 
       const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      if (!msg) return res.status(200).json({ ok: true });
+      if (!msg) return res.status(200).json({ ok: true }); // puede ser un status update
 
-      // Normalizamos el número antes de enviar
-      const from = normalizeArgentinaNumber(msg.from);
+      // Normalizamos el número según el modo de pruebas (si aplica)
+      const fromRaw = msg.from;
+      const from = normalizeArgentinaNumberForTesting(fromRaw);
       const type = msg.type;
 
-      // 1) TEXTO
+      // 1) TEXTO: enviar siempre texto + intentar menú
       if (type === "text") {
         await sendText(from, `¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n${HOURS}\n\n${NO_TURNO}`);
-        await sendMainMenu(from);
+        await sendMainMenu(from); // si falla, queda el texto de fallback
       }
 
-      // 2) INTERACTIVE
+      // 2) INTERACTIVE (botones/lista)
       if (type === "interactive") {
         const inter = msg.interactive;
         const buttonReply = inter?.button_reply;
@@ -179,13 +193,16 @@ export default async function handler(req, res) {
         const selId = buttonReply?.id || listReply?.id || "";
 
         switch (selId) {
+          // Menú principal
           case "MENU_INFO_GENERAL":
             await sendText(from, `${HOURS}\n\n${NO_TURNO}`);
             await sendMainMenu(from);
             break;
+
           case "MENU_SEDES":
             await sendSedesList(from);
             break;
+
           case "MENU_ESTUDIOS":
             await sendText(from, `🧾 Estudios i-R Dental:
 • Panorámica (OPG)
@@ -200,26 +217,62 @@ export default async function handler(req, res) {
 ✅ SIN TURNO, por orden de llegada.`);
             await sendMainMenu(from);
             break;
+
           case "MENU_OBRAS":
             await sendText(from, `🧾 Obras sociales activas:
-AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES, DASUTEN, DOCTHOS, ELEVAR*, ESPORA SALUD*, FATFA, FEMEBA AVELLANEDA, HOSPITAL BRITANICO, HOSPITAL ITALIANO, LUIS PASTEUR, MEDICUS*, NUBIAL, OMA, OMINT*, OSDE, OSDIPP, OSMEBA, OPSA, PODER JUDICIAL (FO)*, PROGRAMAS MEDICOS, QUALITAS, SANCOR SALUD*, SERVESALUD*, SETIA, SIMECO, SIND. MUNIC. AVELLANEDA, SWISS MEDICAL*.
+• AMFFA
+• ANSSAL APDIS
+• APESA SALUD
+• CENTRO MEDICO PUEYRREDON
+• COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES
+• DASUTEN
+• DOCTHOS
+• ELEVAR*
+• ESPORA SALUD*
+• FATFA
+• FEMEBA AVELLANEDA
+• HOSPITAL BRITANICO
+• HOSPITAL ITALIANO
+• LUIS PASTEUR
+• MEDICUS*
+• NUBIAL
+• OMA
+• OMINT*
+• OSDE
+• OSDIPP
+• OSMEBA
+• OPSA
+• PODER JUDICIAL (en orden de Federación Odontológica)*
+• PROGRAMAS MEDICOS
+• QUALITAS
+• SANCOR SALUD*
+• SERVESALUD*
+• SETIA
+• SIMECO
+• SIND. MUNIC. AVELLANEDA
+• SWISS MEDICAL*
 
 (*) En la orden debe incluirse el Diagnóstico.
 
 ⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`);
             await sendMainMenu(from);
             break;
+
           case "MENU_ENVIO":
             await sendText(from, "📤 Para solicitar el envío de un estudio, por favor indicá:\n\n• Apellido y Nombre\n• DNI\n• Fecha de nacimiento\n• Estudio realizado\n• Sede (Quilmes / Avellaneda / Lomas)\n• Preferencia de envío (WhatsApp o Email — si es email, indicarlo)\n\nUn/a operador/a lo gestionará a la brevedad. 🙌");
             await sendMainMenu(from);
             break;
+
           case "MENU_SUBIR_ORDEN":
             await sendText(from, "📎 Para subir tu orden, adjuntá una foto clara de la orden médica.\nUn/a operador/a te responderá con la confirmación y pasos a seguir.");
             await sendMainMenu(from);
             break;
+
           case "MENU_OPERADOR":
             await sendText(from, "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil.");
             break;
+
+          // Submenú sedes
           case "SEDE_QUILMES":
             await sendText(from, sedeInfo("QUILMES"));
             await sendMainMenu(from);
@@ -232,6 +285,7 @@ AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANO
             await sendText(from, sedeInfo("LOMAS"));
             await sendMainMenu(from);
             break;
+
           default:
             await sendText(from, "Te envío el menú nuevamente:");
             await sendMainMenu(from);
