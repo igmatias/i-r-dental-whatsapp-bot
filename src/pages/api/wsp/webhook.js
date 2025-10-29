@@ -152,14 +152,14 @@ async function sendButtons(to, body, buttons = []) {
 }
 
 async function sendMainMenuList(to) {
-  // Lista interactiva (puede fallar en cuentas nuevas, o fuera de ventana)
+  // Lista interactiva
   return sendJson(to, {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "i-R Dental" }, // header admite 'type'
-      body: { text: TXT_BIENVENIDA },               // sin 'type'
-      footer: { text: "Seleccioná una opción" },    // sin 'type'
+      header: { type: "text", text: "i-R Dental" },
+      body: { text: TXT_BIENVENIDA },
+      footer: { text: "Seleccioná una opción" },
       action: {
         button: "Abrir menú",
         sections: [
@@ -181,8 +181,8 @@ async function sendMainMenuList(to) {
   });
 }
 
-// Fallback del menú en 2 tandas de botones (3 + 3)
-async function sendMainMenuButtonsFallback(to) {
+// Menú principal con botones (dos tandas)
+async function sendMainMenuButtons(to) {
   await sendButtons(to, "Menú rápido (1/2): elegí una opción", [
     { id: "MENU_SEDES",    title: "📍 Sedes" },
     { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
@@ -195,6 +195,7 @@ async function sendMainMenuButtonsFallback(to) {
   ]);
 }
 
+// Lista de sedes
 async function sendSedesList(to) {
   return sendJson(to, {
     type: "interactive",
@@ -217,6 +218,15 @@ async function sendSedesList(to) {
       },
     },
   });
+}
+
+// Botones de sedes (complemento/fallback)
+async function sendSedesButtons(to) {
+  return sendButtons(to, "Elegí una sede para ver dirección y contacto:", [
+    { id: "SEDE_QUILMES", title: "Quilmes" },
+    { id: "SEDE_AVELL",   title: "Avellaneda" },
+    { id: "SEDE_LOMAS",   title: "Lomas" },
+  ]);
 }
 
 function sedeInfo(key) {
@@ -257,17 +267,14 @@ export default async function handler(req, res) {
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // 1) TEXTO: siempre texto y luego intento de lista; si falla, botones
+      // 1) Si es texto: bienvenida + LISTA + BOTONES
       if (type === "text") {
         await sendText(from, `¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n${HOURS}\n\n${NO_TURNO}`);
-        const listResp = await sendMainMenuList(from);
-        if (!listResp.ok) {
-          console.log("LIST FALLBACK → sending buttons");
-          await sendMainMenuButtonsFallback(from);
-        }
+        await sendMainMenuList(from);    // lista
+        await sendMainMenuButtons(from); // además, botones
       }
 
-      // 2) INTERACTIVE (botones/lista)
+      // 2) Si es interactivo: manejar selección
       if (type === "interactive") {
         const inter = msg.interactive;
         const buttonReply = inter?.button_reply;
@@ -278,20 +285,12 @@ export default async function handler(req, res) {
           // ===== Menú principal =====
           case "MENU_INFO_GENERAL":
             await sendText(from, `${HOURS}\n\n${NO_TURNO}`);
-            await sendMainMenuButtonsFallback(from);
+            await sendMainMenuButtons(from);
             break;
 
           case "MENU_SEDES": {
-            const r = await sendSedesList(from);
-            if (!r.ok) {
-              // fallback de sedes: texto + botones volver/operador
-              await sendText(from, `Sedes:\n• Quilmes — Olavarría 88\n• Avellaneda — 9 de Julio 64 — 2° A\n• Lomas de Zamora — España 156 — PB\n\nPedime la que quieras y te paso la info.`);
-              await sendButtons(from, "¿Querés volver al menú?", [
-                { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
-                { id: "MENU_OPERADOR", title: "👤 Operador" },
-                { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
-              ]);
-            }
+            await sendSedesList(from);    // lista de sedes
+            await sendSedesButtons(from); // y también botones
             break;
           }
 
@@ -322,8 +321,8 @@ export default async function handler(req, res) {
               "Un/a operador/a lo gestionará a la brevedad. 🙌"
             );
             await sendButtons(from, "¿Querés volver al menú?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "BTN_BACK_MENU",   title: "↩️ Menú" },
+              { id: "MENU_OPERADOR",   title: "👤 Operador" },
               { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
             ]);
             break;
@@ -349,45 +348,40 @@ export default async function handler(req, res) {
           case "SEDE_QUILMES":
             await sendText(from, sedeInfo("QUILMES"));
             await sendButtons(from, "¿Querés otra opción?", [
+              { id: "SEDE_AVELL",    title: "Avellaneda" },
+              { id: "SEDE_LOMAS",    title: "Lomas" },
               { id: "BTN_BACK_MENU", title: "↩️ Menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
-              { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
             ]);
             break;
 
           case "SEDE_AVELL":
             await sendText(from, sedeInfo("AVELL"));
             await sendButtons(from, "¿Querés otra opción?", [
+              { id: "SEDE_QUILMES",  title: "Quilmes" },
+              { id: "SEDE_LOMAS",    title: "Lomas" },
               { id: "BTN_BACK_MENU", title: "↩️ Menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
-              { id: "MENU_OBRAS",    title: "💳 Obras" },
             ]);
             break;
 
           case "SEDE_LOMAS":
             await sendText(from, sedeInfo("LOMAS"));
             await sendButtons(from, "¿Querés otra opción?", [
+              { id: "SEDE_QUILMES",  title: "Quilmes" },
+              { id: "SEDE_AVELL",    title: "Avellaneda" },
               { id: "BTN_BACK_MENU", title: "↩️ Menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
-              { id: "MENU_ENVIO",    title: "📤 Envío" },
             ]);
             break;
 
           // ===== Botón: volver al menú =====
           case "BTN_BACK_MENU":
-            // Intento de lista; si falla, botones
-            {
-              const r = await sendMainMenuList(from);
-              if (!r.ok) await sendMainMenuButtonsFallback(from);
-            }
+            await sendMainMenuList(from);
+            await sendMainMenuButtons(from);
             break;
 
           default:
             await sendText(from, "Te envío el menú nuevamente:");
-            {
-              const r = await sendMainMenuList(from);
-              if (!r.ok) await sendMainMenuButtonsFallback(from);
-            }
+            await sendMainMenuList(from);
+            await sendMainMenuButtons(from);
             break;
         }
       }
