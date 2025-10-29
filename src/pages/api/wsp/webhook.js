@@ -1,5 +1,6 @@
 // src/pages/api/wsp/webhook.js
-import { STORE } from "../../../lib/store";
+import { getStore } from "../../../lib/store";
+const STORE = getStore();
 
 const API_URL = (phoneId) => `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
@@ -451,7 +452,8 @@ async function handleEnvioButton(from, btnId) {
 /** ========= UTIL: push seguro al STORE ========= **/
 function safePush(msg) {
   try {
-    if (STORE && typeof STORE.push === "function") STORE.push(msg);
+    const S = getStore();
+    S.push(msg);
   } catch {}
 }
 

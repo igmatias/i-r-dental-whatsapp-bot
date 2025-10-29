@@ -1,5 +1,4 @@
-import { STORE } from "../../../lib/store";
-
+import { getStore } from "../../../lib/store";
 const API_URL = (id) => `https://graph.facebook.com/v20.0/${id}/messages`;
 
 export default async function handler(req, res) {
@@ -34,9 +33,10 @@ export default async function handler(req, res) {
       return res.status(r.status).json({ ok: false, data });
     }
 
-    // Guardar en store como mensaje saliente
+    // log saliente
+    const STORE = getStore();
     STORE.push({
-      id: `out_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      id: `out_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       ts: Date.now(),
       waFrom: to,
       direction: "out",
