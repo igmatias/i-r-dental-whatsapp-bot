@@ -108,28 +108,65 @@ async function alreadyProcessed(waKey, messageId) {
 
 async function sendText(toRawDigits, body, storeKey) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
-    flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
+    flowLog('SEND_GUARD', {
+      error: 'Missing WhatsApp env',
+      WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID,
+      WHATSAPP_TOKEN: !!WHATSAPP_TOKEN,
+    })
     return { ok: false, status: 500, data: { error: 'Missing env' } }
   }
+
+  // 🔹 Normalización sin el “9”
+  let to = String(toRawDigits || '').replace(/\D/g, '')
+  // Si empieza con 549 (con 9 móvil), lo pasamos a 54 (sin 9)
+  if (to.startsWith('549')) {
+    to = '54' + to.slice(3)
+  }
+
+  // Si tiene + delante, lo removemos (Meta lo quiere sin +)
+  if (to.startsWith('+')) to = to.slice(1)
+
+  // Log informativo
+  flowLog('SEND_TO_SANITIZED', { original: toRawDigits, sanitized: to })
+
   const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`
-  const payload = { messaging_product: 'whatsapp', to: String(toRawDigits), text: { body } }
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    text: { body },
+  }
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+    },
     body: JSON.stringify(payload),
   })
+
   let data = {}
-  try { data = await res.json() } catch {}
-  flowLog('SEND_TEXT', { to: toRawDigits, body, status: res.status, data })
+  try {
+    data = await res.json()
+  } catch {}
+
+  flowLog('SEND_TEXT', { to, body, status: res.status, data })
+
   try {
     const outId = data?.messages?.[0]?.id || `out-${Date.now()}`
     if (storeKey) {
-      await appendMessage(storeKey, { id: outId, from: storeKey, direction: 'out', text: body, ts: Date.now() })
+      await appendMessage(storeKey, {
+        id: outId,
+        from: storeKey,
+        direction: 'out',
+        text: body,
+        ts: Date.now(),
+      })
     }
   } catch {}
+
   return { ok: res.ok, status: res.status, data }
 }
-
 function detectCommand(txt) {
   const t = (txt || '').trim().toLowerCase()
   if (!t) return null
