@@ -6,9 +6,7 @@ const DEFAULT_SECRET =
     ? new URLSearchParams(window.location.search).get('secret') || 'irdental2025'
     : 'irdental2025';
 
-function cls(...a) {
-  return a.filter(Boolean).join(' ');
-}
+function cls(...a) { return a.filter(Boolean).join(' '); }
 function withPlus(wa){ return wa?.startsWith('+') ? wa : `+${wa}` }
 
 export default function OperatorConsole() {
@@ -19,6 +17,14 @@ export default function OperatorConsole() {
   const [pollMs, setPollMs] = useState(2000);
   const [outText, setOutText] = useState('');
   const [sending, setSending] = useState(false);
+
+  // media modal
+  const [showMedia, setShowMedia] = useState(false);
+  const [mediaType, setMediaType] = useState('document'); // 'document' | 'image'
+  const [mediaLink, setMediaLink] = useState('');
+  const [mediaCaption, setMediaCaption] = useState('');
+  const [sendingMedia, setSendingMedia] = useState(false);
+
   const scrollRef = useRef(null);
 
   // Poll chats
@@ -37,16 +43,11 @@ export default function OperatorConsole() {
         const list = Array.isArray(data.chats) ? data.chats : [];
         setChats(list);
         if (!activeWa && list[0]?.wa) setActiveWa(withPlus(list[0].wa));
-      } catch (_err) {
-        // silent
-      }
+      } catch (_err) {}
     }
     load();
     const id = setInterval(load, Math.max(1500, pollMs));
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
+    return () => { alive = false; clearInterval(id); };
   }, [secret, pollMs, activeWa]);
 
   // Poll messages for active chat
@@ -68,29 +69,19 @@ export default function OperatorConsole() {
         const data = await res.json();
         if (!alive) return;
         const list = Array.isArray(data.messages) ? data.messages : [];
-        // claves estables para evitar flicker
         const keyed = list.map((m, i) => ({ ...m, _key: m.id || `${String(m.ts || 0)}-${i}` }));
-        // merge incremental (no reemplazar array completo) + ordenar por ts
         setMessages((prev) => {
           const map = new Map();
           for (const m of prev) map.set(m._key, m);
           for (const m of keyed) map.set(m._key, m);
           return Array.from(map.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0));
         });
-        // autoscroll
-        requestAnimationFrame(() => {
-          if (scrollRef.current) scrollRef.current.scrollTo({ top: 1e9, behavior: 'smooth' });
-        });
-      } catch (_err) {
-        // silent
-      }
+        requestAnimationFrame(() => { if (scrollRef.current) scrollRef.current.scrollTo({ top: 1e9, behavior: 'smooth' }); });
+      } catch (_err) {}
     }
     load();
     const id = setInterval(load, Math.max(1200, pollMs));
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
+    return () => { alive = false; clearInterval(id); };
   }, [secret, activeWa, pollMs]);
 
   async function sendOutgoing() {
@@ -103,17 +94,13 @@ export default function OperatorConsole() {
         body: JSON.stringify({
           op: 'send',
           secret,
-          wa: withPlus(activeWa), // waKey (normalizado) — el server busca el wa_raw o hace fallback
+          wa: withPlus(activeWa),
           text: outText.trim(),
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        console.error('send failed', data);
-      } else {
-        setOutText('');
-        // No hace falta push optimista: el server ya persiste 'out' optimista y real
-      }
+      if (!res.ok) console.error('send failed', data);
+      else setOutText('');
     } catch (e) {
       console.error('send error', e);
     } finally {
@@ -128,6 +115,36 @@ export default function OperatorConsole() {
     }
   }
 
+  async function sendMedia() {
+    if (!activeWa || !mediaLink.trim() || sendingMedia) return;
+    setSendingMedia(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/wsp/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          op: 'send-media',
+          secret,
+          wa: withPlus(activeWa),
+          mediaType,
+          link: mediaLink.trim(),
+          caption: mediaCaption.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) console.error('send media failed', data);
+      else {
+        setShowMedia(false);
+        setMediaLink('');
+        setMediaCaption('');
+      }
+    } catch (e) {
+      console.error('send media error', e);
+    } finally {
+      setSendingMedia(false);
+    }
+  }
+
   const palette = {
     bordo: '#6b0f1a',
     rojo: '#c1121f',
@@ -137,59 +154,27 @@ export default function OperatorConsole() {
   };
 
   return (
-    <div
-      className="min-h-screen"
-      style={{ background: `linear-gradient(180deg, ${palette.negro} 0%, ${palette.gris} 100%)` }}
-    >
+    <div className="min-h-screen" style={{ background: `linear-gradient(180deg, ${palette.negro} 0%, ${palette.gris} 100%)` }}>
       <style>{`
         *{ box-sizing:border-box; }
         body{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial; }
-        .w-full{ width:100%; }
-        .text-left{ text-align:left; }
       `}</style>
 
-      <header
-        style={{
-          padding: '12px 16px',
-          borderBottom: '1px solid #1f1f22',
-          background: palette.negro,
-          color: '#fff',
-        }}
-      >
+      <header style={{ padding: '12px 16px', borderBottom: '1px solid #1f1f22', background: palette.negro, color: '#fff' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 8, height: 24, borderRadius: 4, background: palette.rojo }} />
           <div style={{ fontWeight: 600, fontSize: 18 }}>i-R Dental · Consola de Operador</div>
-          <div
-            style={{
-              marginLeft: 'auto',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              fontSize: 12,
-            }}
-          >
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
             <input
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
               placeholder="OPERATOR_SECRET"
-              style={{
-                padding: '6px 8px',
-                borderRadius: 8,
-                background: 'rgba(0,0,0,.4)',
-                color: '#fff',
-                border: '1px solid rgba(255,255,255,.1)',
-              }}
+              style={{ padding: '6px 8px', borderRadius: 8, background: 'rgba(0,0,0,.4)', color: '#fff', border: '1px solid rgba(255,255,255,.1)' }}
             />
             <select
               value={pollMs}
               onChange={(e) => setPollMs(Number(e.target.value))}
-              style={{
-                padding: '6px 8px',
-                borderRadius: 8,
-                background: 'rgba(0,0,0,.4)',
-                color: '#fff',
-                border: '1px solid rgba(255,255,255,.1)',
-              }}
+              style={{ padding: '6px 8px', borderRadius: 8, background: 'rgba(0,0,0,.4)', color: '#fff', border: '1px solid rgba(255,255,255,.1)' }}
             >
               <option value={1200}>1.2s</option>
               <option value={2000}>2s</option>
@@ -208,21 +193,15 @@ export default function OperatorConsole() {
               <button
                 key={c.wa}
                 onClick={() => setActiveWa(withPlus(c.wa))}
-                className={cls('w-full', 'text-left')}
+                className={cls('w-full')}
                 style={{
-                  width: '100%',
-                  textAlign: 'left',
-                  padding: '12px 12px',
-                  color: '#fff',
+                  width: '100%', textAlign: 'left', padding: '12px 12px', color: '#fff',
                   background: activeWa === withPlus(c.wa) ? 'rgba(255,255,255,.1)' : 'transparent',
-                  border: '0',
-                  cursor: 'pointer',
+                  border: 0, cursor: 'pointer',
                 }}
               >
                 <div style={{ fontSize: 14, fontWeight: 600 }}>{withPlus(c.wa)}</div>
-                <div style={{ fontSize: 12, color: 'rgba(255,255,255,.6)' }}>
-                  {new Date(c.ts).toLocaleString()}
-                </div>
+                <div style={{ fontSize: 12, color: 'rgba(255,255,255,.6)' }}>{new Date(c.ts).toLocaleString()}</div>
               </button>
             ))}
             {chats.length === 0 && (
@@ -232,22 +211,11 @@ export default function OperatorConsole() {
         </aside>
 
         <section style={{ display: 'flex', flexDirection: 'column' }}>
-          <div
-            style={{
-              padding: '8px 16px',
-              borderBottom: '1px solid #1f1f22',
-              background: palette.gris,
-              color: '#fff',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-            }}
-          >
+          <div style={{ padding: '8px 16px', borderBottom: '1px solid #1f1f22', background: palette.gris, color: '#fff', display: 'flex', alignItems: 'center', gap: 12 }}>
             <div style={{ width: 8, height: 16, borderRadius: 4, background: palette.bordo }} />
             <div style={{ fontWeight: 600 }}>{activeWa || 'Seleccioná un chat'}</div>
           </div>
 
-          {/* mini debug opcional */}
           <div style={{ padding: '4px 16px', color: 'rgba(255,255,255,.5)', fontSize: 11 }}>
             consultando: {activeWa || '(sin wa)'}
           </div>
@@ -257,42 +225,33 @@ export default function OperatorConsole() {
               <div
                 key={m._key}
                 style={{
-                  maxWidth: '70%',
-                  marginBottom: 8,
-                  padding: '12px',
-                  borderRadius: 16,
-                  background: m.direction === 'in' ? '#1f2937' : palette.rojo,
-                  color: '#fff',
-                  marginLeft: m.direction === 'in' ? 0 : 'auto',
-                  marginRight: m.direction === 'in' ? 'auto' : 0,
+                  maxWidth: '70%', marginBottom: 8, padding: '12px', borderRadius: 16,
+                  background: m.direction === 'in' ? '#1f2937' : palette.rojo, color: '#fff',
+                  marginLeft: m.direction === 'in' ? 0 : 'auto', marginRight: m.direction === 'in' ? 'auto' : 0,
                 }}
               >
-                <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 6 }}>
-                  {new Date(m.ts).toLocaleString()}
-                </div>
+                <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 6 }}>{new Date(m.ts).toLocaleString()}</div>
 
-                {/* Texto principal */}
-                {m.text && (
-                  <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div>
-                )}
+                {/* Texto */}
+                {m.text && <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div>}
 
-                {/* Botones/lista como chips */}
+                {/* Chips botones/lista */}
                 {Array.isArray(m.buttons) && m.buttons.length > 0 && (
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
                     {m.buttons.map((b, i) => (
-                      <span
-                        key={i}
-                        style={{
-                          padding: '6px 10px',
-                          borderRadius: 999,
-                          background: 'rgba(0,0,0,.25)',
-                          border: '1px solid rgba(255,255,255,.25)',
-                          fontSize: 12,
-                        }}
-                      >
+                      <span key={i} style={{ padding: '6px 10px', borderRadius: 999, background: 'rgba(0,0,0,.25)', border: '1px solid rgba(255,255,255,.25)', fontSize: 12 }}>
                         {b}
                       </span>
                     ))}
+                  </div>
+                )}
+
+                {/* Media OUT/IN mostrado como link si llega con snapshot.file */}
+                {m.file && (
+                  <div style={{ marginTop: 8 }}>
+                    <a href={m.file} target="_blank" rel="noreferrer" style={{ color: '#fff', textDecoration: 'underline' }}>
+                      Ver archivo
+                    </a>
                   </div>
                 )}
               </div>
@@ -301,49 +260,69 @@ export default function OperatorConsole() {
           </div>
 
           {/* Input de salida */}
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: '1fr 120px',
-              gap: 8,
-              padding: '10px 16px',
-              borderTop: '1px solid #1f1f22',
-              background: palette.gris,
-            }}
-          >
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px', gap: 8, padding: '10px 16px', borderTop: '1px solid #1f1f22', background: palette.gris }}>
             <textarea
               value={outText}
               onChange={(e) => setOutText(e.target.value)}
               onKeyDown={onEnter}
               placeholder={activeWa ? `Mensaje a ${activeWa}` : 'Seleccioná un chat'}
               rows={2}
-              style={{
-                resize: 'none',
-                padding: '10px 12px',
-                borderRadius: 10,
-                background: '#111',
-                color: '#fff',
-                border: '1px solid rgba(255,255,255,.15)',
-                outline: 'none',
-              }}
+              style={{ resize: 'none', padding: '10px 12px', borderRadius: 10, background: '#111', color: '#fff', border: '1px solid rgba(255,255,255,.15)', outline: 'none' }}
             />
-            <button
-              onClick={sendOutgoing}
-              disabled={!activeWa || !outText.trim() || sending}
-              style={{
-                border: 0,
-                borderRadius: 10,
-                background: sending ? 'rgba(193,18,31,.5)' : '#c1121f',
-                color: '#fff',
-                fontWeight: 600,
-                cursor: !activeWa || !outText.trim() || sending ? 'not-allowed' : 'pointer',
-              }}
-            >
-              {sending ? 'Enviando…' : 'Enviar'}
-            </button>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <button
+                onClick={() => setShowMedia(true)}
+                disabled={!activeWa}
+                style={{ border: 0, borderRadius: 10, background: '#444', color: '#fff', fontWeight: 600, cursor: !activeWa ? 'not-allowed' : 'pointer' }}
+              >
+                Adjuntar
+              </button>
+              <button
+                onClick={sendOutgoing}
+                disabled={!activeWa || !outText.trim() || sending}
+                style={{ border: 0, borderRadius: 10, background: sending ? 'rgba(193,18,31,.5)' : '#c1121f', color: '#fff', fontWeight: 600, cursor: !activeWa || !outText.trim() || sending ? 'not-allowed' : 'pointer' }}
+              >
+                {sending ? 'Enviando…' : 'Enviar'}
+              </button>
+            </div>
           </div>
         </section>
       </main>
+
+      {/* Modal simple para adjuntar por LINK */}
+      {showMedia && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <div style={{ width: 480, background:'#111', border:'1px solid #333', borderRadius:12, padding:16, color:'#fff' }}>
+            <div style={{ fontSize:16, fontWeight:700, marginBottom:8 }}>Adjuntar archivo (link público)</div>
+            <div style={{ display:'grid', gap:8 }}>
+              <div>
+                <label style={{ fontSize:12, opacity:.8 }}>Tipo</label><br/>
+                <select value={mediaType} onChange={(e)=>setMediaType(e.target.value)} style={{ width:'100%', padding:'8px', borderRadius:8, background:'#000', color:'#fff', border:'1px solid #333' }}>
+                  <option value="document">Documento</option>
+                  <option value="image">Imagen</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize:12, opacity:.8 }}>URL pública (https://...)</label><br/>
+                <input value={mediaLink} onChange={(e)=>setMediaLink(e.target.value)} placeholder="https://…" style={{ width:'100%', padding:'8px', borderRadius:8, background:'#000', color:'#fff', border:'1px solid #333' }}/>
+              </div>
+              <div>
+                <label style={{ fontSize:12, opacity:.8 }}>Caption (opcional)</label><br/>
+                <input value={mediaCaption} onChange={(e)=>setMediaCaption(e.target.value)} placeholder="" style={{ width:'100%', padding:'8px', borderRadius:8, background:'#000', color:'#fff', border:'1px solid #333' }}/>
+              </div>
+            </div>
+            <div style={{ display:'flex', gap:8, justifyContent:'flex-end', marginTop:12 }}>
+              <button onClick={()=>setShowMedia(false)} style={{ border:0, borderRadius:8, padding:'8px 12px', background:'#444', color:'#fff' }}>Cancelar</button>
+              <button onClick={sendMedia} disabled={!mediaLink.trim() || sendingMedia} style={{ border:0, borderRadius:8, padding:'8px 12px', background:'#c1121f', color:'#fff', fontWeight:700 }}>
+                {sendingMedia ? 'Enviando…' : 'Enviar archivo'}
+              </button>
+            </div>
+            <div style={{ marginTop:10, fontSize:12, opacity:.7 }}>
+              * Meta WhatsApp Cloud API acepta media por <b>link público</b>. Si necesitás subir archivos locales, integramos un storage (Vercel Blob / S3) y listo.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

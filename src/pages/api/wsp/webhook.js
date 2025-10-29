@@ -1,15 +1,6 @@
 // ==============================================
 // File: src/pages/api/wsp/webhook.js
-// Purpose: WhatsApp webhook + Operator feed (GET) + Operator SEND (POST)
-// Notes:
-//  - Redis sessions (Upstash) + FLOW_* logs de diagnóstico
-//  - Bienvenida SIEMPRE con botones (menú 1/2 y 2/2)
-//  - Menús: Sedes / Estudios / Obras / Envío / Subir orden / Operador
-//  - Flujo "Envío de estudio" con pasos y botones (sede / vía / confirmar)
-//  - Persistencia para consola: lpush chat:..., zadd chats:index
-//  - Upstash v1 compat: zrange({rev:true, withScores:true}) + polyfill zrevrange
-//  - Envío AR sin “9”: normalizamos a 54… (E.164 sin '+')
-//  - Operator SEND con persistencia optimista y fallback de wa_raw
+// Purpose: WhatsApp webhook + Operator feed (GET) + Operator SEND & SEND-MEDIA (POST)
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -24,7 +15,7 @@ const {
   WSP_VERIFY_TOKEN,
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
-  TEST_RECIPIENT_FORMAT = 'no9', // 'no9' (mantener sin 9) | 'with9' | ''
+  TEST_RECIPIENT_FORMAT = 'no9', // 'no9' (sin 9) | 'with9' | ''
 } = process.env
 
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
@@ -36,19 +27,19 @@ if (typeof redis.zrevrange !== 'function') {
   }
 }
 
-// --- Keys Redis ---
+// --- Keys ---
 const kSess   = (wa) => `sess:${wa}`
 const kMsgs   = (wa) => `chat:${wa}:messages`
 const kSeen   = (wa) => `seen:${wa}`
 const kChats  = 'chats:index'
-const kWaRaw  = (wa) => `waid:${wa}` // último wa_id (crudo) visto
+const kWaRaw  = (wa) => `waid:${wa}` // último wa_id crudo (para enviar)
 
-// --- LOG helper ---
+// --- Logs ---
 function flowLog(tag, obj) {
   console.log(`FLOW_${tag} →`, typeof obj === 'string' ? obj : JSON.stringify(obj))
 }
 
-// --- HTTP body reader (raw JSON) ---
+// --- Body reader ---
 async function readBody(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
@@ -56,9 +47,8 @@ async function readBody(req) {
   try { return { raw, json: JSON.parse(raw) } } catch { return { raw, json: {} } }
 }
 
-// --- Normalización de números ---
+// --- Normalización números ---
 function normalizeWaKey(waId) {
-  // Guardamos claves con "+54..." (para UI), pero enviamos a Meta sin "+"
   let id = waId || ''
   if (!id) return null
   if (!id.startsWith('+')) id = '+' + id
@@ -66,15 +56,14 @@ function normalizeWaKey(waId) {
   if (TEST_RECIPIENT_FORMAT === 'no9')   id = id.replace(/^\+549/, '+54')
   return id
 }
-
-// Sanitiza para enviar a Meta: solo dígitos y SIN “9” intermedio para AR
 function sanitizeToE164NoPlus(toRawDigits) {
   let to = String(toRawDigits || '').replace(/\D/g, '')
   if (to.startsWith('549')) to = '54' + to.slice(3) // quitar 9
-  return to // Meta quiere sin '+'
+  return to
 }
+function ensurePlus(wa) { return wa?.startsWith('+') ? wa : `+${wa}` }
 
-// --- Sesiones JSON-safe ---
+// --- Sesiones ---
 async function getSession(waKey) {
   const raw = await redis.get(kSess(waKey))
   try { return raw ? JSON.parse(raw) : { state: 'idle', step: 0 } }
@@ -86,13 +75,13 @@ async function setSession(waKey, sess) {
 
 // --- Persistencia consola ---
 async function appendMessage(waKey, msg) {
-  const key = waKey?.startsWith('+') ? waKey : `+${waKey}`
+  const key = ensurePlus(waKey)
   await redis.lpush(kMsgs(key), JSON.stringify(msg))
   await redis.ltrim(kMsgs(key), 0, 499)
   await redis.zadd(kChats, { score: msg.ts || Date.now(), member: key })
 }
 async function getHistory(waKey, limit = 100) {
-  const key = waKey?.startsWith('+') ? waKey : `+${waKey}`
+  const key = ensurePlus(waKey)
   const arr = await redis.lrange(kMsgs(key), 0, limit - 1)
   const out = arr.map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
   return out.sort((a,b) => (a.ts||0)-(b.ts||0))
@@ -104,14 +93,13 @@ async function alreadyProcessed(waKey, messageId) {
   return false
 }
 
-// --- Envíos ---
+// --- Envíos base ---
 async function sendJson(toRawDigits, payload, storeKey, label='SEND_JSON') {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
     return { ok:false, status:500, data:{ error:'Missing env' } }
   }
   let to = sanitizeToE164NoPlus(toRawDigits)
-  flowLog(`${label}_REQ`, { to, type: payload.type || 'text' })
   const url = `https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`
   const res = await fetch(url, {
     method: 'POST',
@@ -120,31 +108,42 @@ async function sendJson(toRawDigits, payload, storeKey, label='SEND_JSON') {
   })
   let data = {}
   try { data = await res.json() } catch {}
-  flowLog(`${label}_RES`, { status: res.status, data })
+  flowLog(`${label}`, { to, status: res.status, data })
+
+  // Persistencia OUT
   try {
     const outId = data?.messages?.[0]?.id || `out-${Date.now()}`
-    // Persistimos una representación legible para consola
     const snapshot = {
       id: outId,
       from: storeKey,
       direction: 'out',
       ts: Date.now(),
     }
+    // text
     if (payload.type === 'text') snapshot.text = payload.text?.body || ''
+    // buttons / list
     if (payload.type === 'interactive') {
       const i = payload.interactive || {}
-      snapshot.text = (i.body?.text) || ''
+      snapshot.text = i?.body?.text || snapshot.text || ''
       if (i.type === 'button') {
         snapshot.buttons = (i.action?.buttons || []).map(b => b?.reply?.title).filter(Boolean)
       }
       if (i.type === 'list') {
-        // Mostrar títulos de items de lista como “chips”
         const items = []
         for (const sec of i.action?.sections || []) {
           for (const it of sec?.rows || []) items.push(it?.title)
         }
         snapshot.buttons = items
       }
+    }
+    // media
+    if (payload.type === 'image') {
+      snapshot.text = payload?.image?.caption || '(imagen)'
+      snapshot.file = payload?.image?.link
+    }
+    if (payload.type === 'document') {
+      snapshot.text = payload?.document?.caption || '(documento)'
+      snapshot.file = payload?.document?.link
     }
     await appendMessage(storeKey, snapshot)
   } catch {}
@@ -154,9 +153,7 @@ async function sendJson(toRawDigits, payload, storeKey, label='SEND_JSON') {
 async function sendText(toRawDigits, body, storeKey) {
   return sendJson(toRawDigits, { type:'text', text:{ body } }, storeKey, 'SEND_TEXT')
 }
-
 async function sendButtons(toRawDigits, body, buttons, storeKey) {
-  // Máx 3 botones
   const payload = {
     type: 'interactive',
     interactive: {
@@ -167,7 +164,6 @@ async function sendButtons(toRawDigits, body, buttons, storeKey) {
   }
   return sendJson(toRawDigits, payload, storeKey, 'SEND_BUTTONS')
 }
-
 async function sendList(toRawDigits, body, sections, storeKey) {
   const payload = {
     type: 'interactive',
@@ -179,25 +175,28 @@ async function sendList(toRawDigits, body, sections, storeKey) {
   }
   return sendJson(toRawDigits, payload, storeKey, 'SEND_LIST')
 }
+async function sendDocument(toRawDigits, link, caption, storeKey) {
+  return sendJson(toRawDigits, { type:'document', document:{ link, caption } }, storeKey, 'SEND_DOC')
+}
+async function sendImage(toRawDigits, link, caption, storeKey) {
+  return sendJson(toRawDigits, { type:'image', image:{ link, caption } }, storeKey, 'SEND_IMG')
+}
 
-// --- Textos base / data ---
+// --- Textos base ---
 const HOURS = `🕒 Horarios (todas las sedes)
 • Lunes a viernes: 09:00 a 17:30
 • Sábados: 09:00 a 12:30`
 const NO_TURNO = `📌 Atención SIN TURNO, por orden de llegada.`
-
 const LINKS = {
   QUILMES: 'https://maps.google.com/?q=i-R+Dental+Quilmes',
   AVELL:   'https://maps.google.com/?q=i-R+Dental+Avellaneda',
   LOMAS:   'https://maps.google.com/?q=i-R+Dental+Lomas',
 }
-
 const SEDES = {
   QUILMES: { title:'Sede Quilmes — i-R Dental',   dir:'Moreno 851 — 1° B', tel:'4257-3638', mail:'quilmes@irdental.com.ar', link: LINKS.QUILMES },
   AVELL:   { title:'Sede Avellaneda — i-R Dental', dir:'9 de Julio 64 — 2° A', tel:'4222-5553', mail:'avellaneda@irdental.com.ar', link: LINKS.AVELL },
   LOMAS:   { title:'Sede Lomas de Zamora — i-R Dental', dir:'España 156 — PB', tel:'4244-0148', mail:'lomas@irdental.com.ar', link: LINKS.LOMAS },
 }
-
 const TXT_ESTUDIOS = `🧾 Estudios i-R Dental:
 • Panorámica (OPG)
 • Cefalométrica (lateral/PA)
@@ -209,7 +208,6 @@ const TXT_ESTUDIOS = `🧾 Estudios i-R Dental:
 • Fotografías intra/extraorales (si corresponde)
 
 ✅ SIN TURNO, por orden de llegada.`
-
 const TXT_OBRAS = `💳 Obras sociales activas:
 AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE FARMACÉUTICOS, DASMI, DASUTeN, FEDERADA, GALENO*, IOMA*, IOSFA, MEDICUS*, OMINT*, OSDE*, OSECAC, OSPACA, OSPE, OSPERYHRA, PAMI, PREMEDIC, SIMECO, SWISS MEDICAL*.
 (*) Algunas con requisitos de orden/diagnóstico.
@@ -228,7 +226,6 @@ async function sendMainMenuButtons(toRawDigits, storeKey) {
     { id:'MENU_OPERADOR',    title:'👤 Operador' },
   ], storeKey)
 }
-
 async function sendSedesButtons(toRawDigits, storeKey) {
   return sendButtons(toRawDigits, 'Elegí una sede para ver dirección y contacto:', [
     { id:'SEDE_QUILMES', title:'Quilmes' },
@@ -236,7 +233,6 @@ async function sendSedesButtons(toRawDigits, storeKey) {
     { id:'SEDE_LOMAS',   title:'Lomas' },
   ], storeKey)
 }
-
 function sedeInfo(key) {
   const s = SEDES[key]
   return `📍 ${s.title}
@@ -270,9 +266,7 @@ async function flowStart(fromKey) {
     apellido:'', nombre:'', dni:'', fechaNac:'', estudio:'', sede:'', via:'', email:''
   }, startedAt: Date.now() })
 }
-async function flowEnd(fromKey) {
-  await setSession(fromKey, { state:'idle', step:0 })
-}
+async function flowEnd(fromKey) { await setSession(fromKey, { state:'idle', step:0 }) }
 
 async function promptNext(waRaw, waKey) {
   const s = await getSession(waKey)
@@ -306,77 +300,53 @@ async function promptNext(waRaw, waKey) {
       await sendText(waRaw, 'Listo. Si necesitás enviar un estudio, escribí: Envío de estudio', waKey)
   }
 }
-
 async function handleEnvioText(waRaw, waKey, rawBody) {
   const s = await getSession(waKey)
   if (!s || s.state !== 'envio_estudio') return false
-
   const body = (rawBody || '').trim()
   if (/^(cancelar|salir|menu|menú)$/i.test(body)) {
-    await flowEnd(waKey)
-    await sendText(waRaw, 'Se canceló la solicitud. Te dejo el menú:', waKey)
-    await sendMainMenuButtons(waRaw, waKey)
-    return true
+    await flowEnd(waKey); await sendText(waRaw, 'Se canceló la solicitud. Te dejo el menú:', waKey); await sendMainMenuButtons(waRaw, waKey); return true
   }
-
   switch (s.step) {
-    case 'APELLIDO':
-      s.data.apellido = body.toUpperCase()
-      s.step = 'NOMBRE'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
-    case 'NOMBRE':
-      s.data.nombre = body.toUpperCase()
-      s.step = 'DNI'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+    case 'APELLIDO': s.data.apellido = body.toUpperCase(); s.step='NOMBRE';         await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+    case 'NOMBRE':   s.data.nombre   = body.toUpperCase(); s.step='DNI';            await setSession(waKey, s); await promptNext(waRaw, waKey); return true
     case 'DNI': {
-      const digits = body.replace(/\D/g,'')
-      if (!isValidDni(digits)) { await sendText(waRaw, 'El DNI no parece válido. Escribilo solo con números (6 a 9 dígitos).', waKey); return true }
-      s.data.dni = digits
-      s.step = 'FECHA_NAC'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+      const digits = body.replace(/\D/g,''); if (!isValidDni(digits)) { await sendText(waRaw, 'DNI no válido (6–9 dígitos).', waKey); return true }
+      s.data.dni = digits; s.step='FECHA_NAC';                                      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
     }
     case 'FECHA_NAC': {
-      const norm = normalizeDate(body)
-      if (!norm) { await sendText(waRaw, 'Formato no válido. Usá DD/MM/AAAA o AAAA-MM-DD.', waKey); return true }
-      s.data.fechaNac = norm
-      s.step = 'ESTUDIO'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+      const norm = normalizeDate(body); if (!norm) { await sendText(waRaw, 'Usá DD/MM/AAAA o AAAA-MM-DD.', waKey); return true }
+      s.data.fechaNac = norm; s.step='ESTUDIO';                                      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
     }
-    case 'ESTUDIO':
-      s.data.estudio = body
-      s.step = 'SEDE'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+    case 'ESTUDIO':  s.data.estudio = body; s.step='SEDE';                           await setSession(waKey, s); await promptNext(waRaw, waKey); return true
     case 'EMAIL_IF_NEEDED': {
-      const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body)
-      if (!ok) { await sendText(waRaw, 'Email no válido. Probá nuevamente.', waKey); return true }
-      s.data.email = body
-      s.step = 'CONFIRM'
-      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
+      const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body); if (!ok) { await sendText(waRaw, 'Email no válido.', waKey); return true }
+      s.data.email = body; s.step='CONFIRM';                                         await setSession(waKey, s); await promptNext(waRaw, waKey); return true
     }
   }
   return false
 }
-
-async function handleEnvioButton(waRaw, waKey, btnId) {
+async function handleEnvioButton(waRaw, waKey, btnIdOrTitle) {
   const s = await getSession(waKey)
   if (!s || s.state !== 'envio_estudio') return false
+  const sel = (btnIdOrTitle || '').toUpperCase()
 
   switch (s.step) {
     case 'SEDE':
-      if (btnId === 'EV_SEDE_QUILMES' || btnId === 'EV_SEDE_AVELL' || btnId === 'EV_SEDE_LOMAS') {
-        s.data.sede = btnId.replace('EV_SEDE_','').toLowerCase()
-        s.step = 'VIA'
-        await setSession(waKey, s); await promptNext(waRaw, waKey); return true
-      }
-      await sendText(waRaw, 'Elegí una opción de los botones, por favor.', waKey); return true
+      if (/EV_SEDE_QUILMES|QUILMES/.test(sel)) { s.data.sede='quilmes'; s.step='VIA' }
+      else if (/EV_SEDE_AVELL|AVELLANEDA/.test(sel)) { s.data.sede='avellaneda'; s.step='VIA' }
+      else if (/EV_SEDE_LOMAS|LOMAS/.test(sel)) { s.data.sede='lomas'; s.step='VIA' }
+      else { await sendText(waRaw, 'Elegí una opción de los botones, por favor.', waKey); return true }
+      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
 
     case 'VIA':
-      if (btnId === 'EV_VIA_WSP') { s.data.via = 'WhatsApp'; s.step = 'CONFIRM'; await setSession(waKey, s); await promptNext(waRaw, waKey); return true }
-      if (btnId === 'EV_VIA_EMAIL'){ s.data.via = 'Email';    s.step = 'EMAIL_IF_NEEDED'; await setSession(waKey, s); await promptNext(waRaw, waKey); return true }
-      await sendText(waRaw, 'Elegí una opción de los botones, por favor.', waKey); return true
+      if (/EV_VIA_WSP|WHATSAPP/.test(sel)) { s.data.via='WhatsApp'; s.step='CONFIRM' }
+      else if (/EV_VIA_EMAIL|EMAIL/.test(sel)) { s.data.via='Email'; s.step='EMAIL_IF_NEEDED' }
+      else { await sendText(waRaw, 'Elegí una opción de los botones, por favor.', waKey); return true }
+      await setSession(waKey, s); await promptNext(waRaw, waKey); return true
 
     case 'CONFIRM':
-      if (btnId === 'EV_CONFIRM_YES') {
+      if (/EV_CONFIRM_YES|CONFIRMAR|SI|SÍ|OK|CORRECTO/.test(sel)) {
         await sendText(waRaw, '✅ Recibimos tu solicitud. Un/a operador/a la gestionará a la brevedad.', waKey)
         await flowEnd(waKey)
         await sendButtons(waRaw, '¿Querés volver al menú o hablar con un operador?', [
@@ -385,7 +355,7 @@ async function handleEnvioButton(waRaw, waKey, btnId) {
         ], waKey)
         return true
       }
-      if (btnId === 'EV_CONFIRM_NO') {
+      if (/EV_CONFIRM_NO|CANCELAR/.test(sel)) {
         await flowEnd(waKey)
         await sendText(waRaw, 'Solicitud cancelada. Te dejo el menú:', waKey)
         await sendMainMenuButtons(waRaw, waKey)
@@ -397,36 +367,47 @@ async function handleEnvioButton(waRaw, waKey, btnId) {
 }
 
 // --- Router de menús ---
-async function routeMenuSelection(waRaw, waKey, selId) {
-  switch (selId) {
+async function routeMenuSelection(waRaw, waKey, selIdOrTitle) {
+  const sel = (selIdOrTitle || '').toUpperCase()
+  switch (sel) {
     case 'BTN_BACK_MENU':
+    case 'MENÚ':
+    case 'MENU':
       await sendMainMenuButtons(waRaw, waKey); return true
 
     case 'MENU_SEDES':
+    case '📍 SEDES':
       await sendSedesButtons(waRaw, waKey); return true
     case 'SEDE_QUILMES':
+    case 'QUILMES':
       await sendText(waRaw, sedeInfo('QUILMES'), waKey); return true
     case 'SEDE_AVELL':
+    case 'AVELLANEDA':
       await sendText(waRaw, sedeInfo('AVELL'), waKey); return true
     case 'SEDE_LOMAS':
+    case 'LOMAS':
       await sendText(waRaw, sedeInfo('LOMAS'), waKey); return true
 
     case 'MENU_ESTUDIOS':
+    case '🧾 ESTUDIOS':
       await sendText(waRaw, TXT_ESTUDIOS, waKey); return true
 
     case 'MENU_OBRAS':
+    case '💳 OBRAS SOCIALES':
       await sendText(waRaw, TXT_OBRAS, waKey); return true
 
     case 'MENU_SUBIR_ORDEN':
-      await sendText(waRaw,
-        '📎 Para subir tu orden, adjuntá una foto clara de la orden médica.\n' +
-        'Un/a operador/a te responderá con la confirmación.', waKey)
+    case '📎 SUBIR ORDEN':
+      await sendText(waRaw, '📎 Adjuntá una foto clara de la orden médica. Un/a operador/a te confirmará la recepción.', waKey)
       return true
 
     case 'MENU_OPERADOR':
+    case '👤 OPERADOR':
       await sendText(waRaw, '👤 Derivando a operador. Te responderán a la brevedad.', waKey); return true
 
-    case 'MENU_ENVIO': // iniciar flujo
+    case 'MENU_ENVIO':
+    case '📤 ENVÍO DE ESTUDIO':
+    case '📤 ENVIO DE ESTUDIO':
       flowLog('START', { wa: waKey })
       await flowStart(waKey)
       await sendText(waRaw, 'Vamos a tomar los datos para enviar tu estudio. Podés escribir **cancelar** en cualquier momento.', waKey)
@@ -443,9 +424,10 @@ async function sendWelcome(waRaw, waKey) {
 }
 
 // --- Router principal ---
-async function routeIncomingMessage(waRaw, waKey, kind, payloadTextOrId) {
-  // Bienvenida SIEMPRE si está idle y no es comando directo del flujo
+async function routeIncomingMessage(waRaw, waKey, kind, payloadTextOrId, payloadTitle) {
   const sess = await getSession(waKey)
+
+  // Bienvenida SIEMPRE si idle y no es comando directo
   if (!sess || sess.state === 'idle') {
     if (kind === 'text') {
       const t = (payloadTextOrId || '').trim().toLowerCase()
@@ -455,7 +437,8 @@ async function routeIncomingMessage(waRaw, waKey, kind, payloadTextOrId) {
   }
 
   if (kind === 'interactive') {
-    const sel = payloadTextOrId || ''
+    // Tomamos id o, si no viene, el title
+    const sel = payloadTextOrId || payloadTitle || ''
     flowLog('BTN_STEP', { wa: waKey, sel })
     if (await handleEnvioButton(waRaw, waKey, sel)) return
     if (await routeMenuSelection(waRaw, waKey, sel)) return
@@ -466,20 +449,18 @@ async function routeIncomingMessage(waRaw, waKey, kind, payloadTextOrId) {
     const text = payloadTextOrId || ''
     flowLog('TEXT_STEP', { wa: waKey, text })
     if (await handleEnvioText(waRaw, waKey, text)) return
-
     if (/(envio|envío) de estudio|^1$/.test((text||'').toLowerCase())) {
       await routeMenuSelection(waRaw, waKey, 'MENU_ENVIO'); return
     }
-
     await sendText(waRaw, 'Para iniciar, tocá un botón del menú o escribí: Envío de estudio.', waKey)
     await sendMainMenuButtons(waRaw, waKey)
     return
   }
 }
 
-// --- Handler HTTP ---
+// --- Handler ---
 export default async function handler(req, res) {
-  // GET: verificación Meta o feed operador
+  // GET: verify Meta / feed operador
   if (req.method === 'GET') {
     const mode = req.query['hub.mode']
     const token = req.query['hub.verify_token']
@@ -498,7 +479,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ wa, messages: history })
     }
 
-    // Lista de chats recientes (desc)
     const rows = await redis.zrange(kChats, 0, 49, { rev:true, withScores:true })
     let items
     if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object') {
@@ -506,38 +486,58 @@ export default async function handler(req, res) {
     } else {
       items = []; for (let i=0;i<rows.length;i+=2) items.push({ wa:rows[i], ts:Number(rows[i+1]) })
     }
-    flowLog('FEED_CHATS', { count: items?.length || 0, sample: items?.slice?.(0, 3) || [] })
+    flowLog('FEED_CHATS', { count: items?.length || 0, sample: items?.slice?.(0,3) || [] })
     return res.status(200).json({ chats: items })
   }
 
-  // POST: WhatsApp webhook events o envío de operador
+  // POST: operador o Meta webhook
   if (req.method === 'POST') {
     const { raw, json } = await readBody(req)
 
-    // Rama operador
+    // --- Operador: TEXT
     if (json?.op === 'send') {
       const { secret, wa, text } = json || {}
       if (secret !== OPERATOR_SECRET) return res.status(401).json({ error:'unauthorized' })
       if (!wa || !text) return res.status(400).json({ error:'wa and text required' })
 
-      // Persistencia optimista: aparece YA en consola
+      // Persistencia optimista
       const optimisticId = `out-local-${Date.now()}`
       await appendMessage(wa, { id: optimisticId, from: wa, direction: 'out', text, ts: Date.now() })
 
       let waRaw = await redis.get(kWaRaw(wa))
-      if (!waRaw) waRaw = wa.replace(/^\+/, '') // fallback básico
-
+      if (!waRaw) waRaw = wa.replace(/^\+/, '')
       const r = await sendText(waRaw, text, wa)
 
-      // Log y marca de error (opcional)
       if (!r.ok) {
         await appendMessage(wa, { id: `${optimisticId}-err`, from: wa, direction: 'out', text: `⚠️ Error envío: ${r.status}`, ts: Date.now() })
       }
-
       return res.status(r.ok ? 200 : 500).json(r)
     }
 
-    // Rama Meta webhook
+    // --- Operador: MEDIA (document/image con link)
+    if (json?.op === 'send-media') {
+      const { secret, wa, mediaType, link, caption } = json || {}
+      if (secret !== OPERATOR_SECRET) return res.status(401).json({ error:'unauthorized' })
+      if (!wa || !mediaType || !link) return res.status(400).json({ error:'wa, mediaType, link required' })
+
+      // Persistencia optimista
+      const optimisticId = `out-media-${Date.now()}`
+      await appendMessage(wa, { id: optimisticId, from: wa, direction: 'out', text: caption || `(${mediaType})`, ts: Date.now(), file: link })
+
+      let waRaw = await redis.get(kWaRaw(wa))
+      if (!waRaw) waRaw = wa.replace(/^\+/, '')
+
+      const r = mediaType === 'image'
+        ? await sendImage(waRaw, link, caption || '', wa)
+        : await sendDocument(waRaw, link, caption || '', wa)
+
+      if (!r.ok) {
+        await appendMessage(wa, { id: `${optimisticId}-err`, from: wa, direction: 'out', text: `⚠️ Error envío media: ${r.status}`, ts: Date.now(), file: link })
+      }
+      return res.status(r.ok ? 200 : 500).json(r)
+    }
+
+    // --- Meta webhook
     flowLog('WEBHOOK_BODY', raw)
     const entry  = json?.entry?.[0]
     const change = entry?.changes?.[0]
@@ -553,16 +553,12 @@ export default async function handler(req, res) {
     const msg     = value?.messages?.[0]
     if (!waKey || !msg) { flowLog('MISSING_MSG', { wa:waIdRaw, hasMsg:!!msg }); return res.status(200).json({ ok:true }) }
 
-    // Guardar último wa_id crudo para operador
     if (waIdRaw) await redis.set(kWaRaw(waKey), waIdRaw)
-
-    // Idempotencia
     if (await alreadyProcessed(waKey, msg.id)) { flowLog('DUPLICATE', { wa:waKey, id:msg.id }); return res.status(200).json({ ok:true }) }
 
     const type = msg.type
     const ts   = Number(msg.timestamp ? Number(msg.timestamp) * 1000 : Date.now())
 
-    // Persistencia consola (IN) + ruteo
     if (type === 'text') {
       const bodyIn = msg.text?.body || ''
       await appendMessage(waKey, { id:msg.id, from:waKey, direction:'in', text: bodyIn, ts })
@@ -572,13 +568,14 @@ export default async function handler(req, res) {
 
     if (type === 'interactive') {
       const selId = msg?.interactive?.button_reply?.id || msg?.interactive?.list_reply?.id || ''
-      await appendMessage(waKey, { id:msg.id, from:waKey, direction:'in', text: selId, ts, type:'interactive', meta: msg.interactive })
-      if (await handleEnvioButton(waIdRaw, waKey, selId)) return res.status(200).json({ ok:true })
-      await routeIncomingMessage(waIdRaw, waKey, 'interactive', selId)
+      const selTitle = msg?.interactive?.button_reply?.title || msg?.interactive?.list_reply?.title || ''
+      await appendMessage(waKey, { id:msg.id, from:waKey, direction:'in', text: selId || selTitle, ts, type:'interactive', meta: msg.interactive })
+      if (await handleEnvioButton(waIdRaw, waKey, selId || selTitle)) return res.status(200).json({ ok:true })
+      await routeIncomingMessage(waIdRaw, waKey, 'interactive', selId, selTitle)
       return res.status(200).json({ ok:true })
     }
 
-    // Otros tipos
+    // media entrante u otros tipos
     await appendMessage(waKey, { id:msg.id, from:waKey, direction:'in', text:`[${type}]`, ts })
     await sendText(waIdRaw, 'Recibimos tu mensaje. Para empezar, tocá un botón del menú o escribí: Envío de estudio.', waKey)
     await sendMainMenuButtons(waIdRaw, waKey)
