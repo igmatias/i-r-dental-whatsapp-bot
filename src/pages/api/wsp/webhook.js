@@ -2,15 +2,15 @@
 // File: src/pages/api/wsp/webhook.js
 // Purpose: WhatsApp webhook + Operator feed (GET)
 // Notes:
-//  - Implements Redis sessions with Upstash (@upstash/redis)
-//  - Adds FLOW_* logs for quick diagnosis
-//  - Fixes: (a) first prompt for "Envío de estudio" flow, (b) idempotency to avoid double-processing,
-//           (c) stores ordered message history for operator console, (d) optional GET endpoint for operator
+//  - Redis sessions (Upstash) + FLOW_* logs
+//  - Idempotencia por message.id
+//  - Historial para consola y endpoint GET
+//  - Envío SIEMPRE a wa_id crudo (AR 549...), storage con wa normalizado
 // ==============================================
 
 import { Redis } from '@upstash/redis'
 
-export const config = { api: { bodyParser: false } } // parse raw for accurate logs
+export const config = { api: { bodyParser: false } }
 
 // --- ENV ---
 const {
@@ -36,7 +36,7 @@ async function readBody(req) {
   try { return { raw, json: JSON.parse(raw) } } catch { return { raw, json: {} } }
 }
 
-function toRawFromWaKey(waKey){ return (waKey||'').replace(/^\+/, ''); }
+function toRawFromWaKey(waKey){ return (waKey||'').replace(/^\+/, '') }
 
 function normalizeWaId(waId) {
   let id = waId
@@ -50,12 +50,39 @@ function normalizeWaId(waId) {
   return id
 }
 
+// Redis keys
+const kSess  = (wa) => `sess:${wa}`
+const kMsgs  = (wa) => `chat:${wa}:messages`
+const kSeen  = (wa) => `seen:${wa}`
+const kChats = 'chats:index'
+
+// JSON-safe session helpers
 async function getSession(waKey) {
   const raw = await redis.get(kSess(waKey))
-  try { return raw ? JSON.parse(raw) : { state: 'idle', step: 0 } } catch { return { state: 'idle', step: 0 } }
+  try { return raw ? JSON.parse(raw) : { state: 'idle', step: 0 } }
+  catch { return { state: 'idle', step: 0 } }
 }
 async function setSession(waKey, sess) {
   return await redis.set(kSess(waKey), JSON.stringify(sess))
+}
+
+async function appendMessage(waKey, msg) {
+  await redis.lpush(kMsgs(waKey), JSON.stringify(msg))
+  await redis.ltrim(kMsgs(waKey), 0, 499)
+  await redis.zadd(kChats, { score: msg.ts || Date.now(), member: waKey })
+}
+
+async function getHistory(waKey, limit = 100) {
+  const arr = await redis.lrange(kMsgs(waKey), 0, limit - 1)
+  const parsed = arr.map((s) => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+  return parsed.sort((a, b) => (a.ts || 0) - (b.ts || 0))
+}
+
+async function alreadyProcessed(waKey, messageId) {
+  const last = await redis.get(kSeen(waKey))
+  if (last === messageId) return true
+  await redis.set(kSeen(waKey), messageId)
+  return false
 }
 
 async function sendText(toRawDigits, body, storeKey) {
@@ -76,34 +103,6 @@ async function sendText(toRawDigits, body, storeKey) {
   return { ok: res.ok, status: res.status, data }
 }
 
-// Redis keys
-const kSess = (wa) => `sess:${wa}`
-const kMsgs = (wa) => `chat:${wa}:messages`
-const kSeen = (wa) => `seen:${wa}`
-const kChats = 'chats:index'
-
-async function appendMessage(wa, msg) {
-  await redis.lpush(kMsgs(wa), JSON.stringify(msg))
-  await redis.ltrim(kMsgs(wa), 0, 499)
-  await redis.zadd(kChats, { score: msg.ts || Date.now(), member: wa })
-}
-
-async function getHistory(wa, limit = 100) {
-  const arr = await redis.lrange(kMsgs(wa), 0, limit - 1)
-  const parsed = arr.map((s) => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-  return parsed.sort((a, b) => (a.ts || 0) - (b.ts || 0))
-}
-
-async function getSession(wa) { return (await redis.get(kSess(wa))) || { state: 'idle', step: 0 } }
-async function setSession(wa, sess) { return await redis.set(kSess(wa), sess) }
-
-async function alreadyProcessed(wa, messageId) {
-  const last = await redis.get(kSeen(wa))
-  if (last === messageId) return true
-  await redis.set(kSeen(wa), messageId)
-  return false
-}
-
 function detectCommand(txt) {
   const t = (txt || '').trim().toLowerCase()
   if (!t) return null
@@ -115,7 +114,7 @@ function detectCommand(txt) {
 async function handleFlowEnvioEstudio(waRaw, waKey, sess, incomingText) {
   if (sess.state !== 'envio_estudio') {
     sess = { state: 'envio_estudio', step: 1, data: {} }
-    await setSession(wa, sess)
+    await setSession(waKey, sess)
     await sendText(waRaw, 'Perfecto. Te voy a solicitar algunos datos para enviar el estudio.\n1) Nombre y apellido del paciente:', waKey)
     return sess
   }
@@ -125,41 +124,41 @@ async function handleFlowEnvioEstudio(waRaw, waKey, sess, incomingText) {
       if (t.length < 2) { await sendText(waRaw, 'Por favor, indicá nombre y apellido válidos.', waKey); return sess }
       sess.data.nombre = t
       sess.step = 2
-      await setSession(wa, sess)
+      await setSession(waKey, sess)
       await sendText(waRaw, '2) Tipo de estudio (por ej.: panorámica, periapical, teleradiografía):', waKey)
       return sess
     case 2:
       sess.data.tipo = t
       sess.step = 3
-      await setSession(wa, sess)
+      await setSession(waKey, sess)
       await sendText(waRaw, '3) Fecha del estudio (dd/mm/aaaa):', waKey)
       return sess
     case 3:
       sess.data.fecha = t
       sess.step = 4
-      await setSession(wa, sess)
+      await setSession(waKey, sess)
       await sendText(waRaw, '4) Sede donde lo realizó (Quilmes / Avellaneda / Lomas):', waKey)
       return sess
     case 4:
       sess.data.sede = t
       sess.step = 5
-      await setSession(wa, sess)
+      await setSession(waKey, sess)
       await sendText(waRaw, `¡Gracias! Confirmá por favor:\n• Paciente: ${sess.data.nombre}\n• Estudio: ${sess.data.tipo}\n• Fecha: ${sess.data.fecha}\n• Sede: ${sess.data.sede}\n\n¿Está correcto? Responde SI o NO.`, waKey)
       return sess
     case 5:
       if (/^si|sí|ok|correcto$/i.test(t)) {
         sess.step = 6
-        await setSession(wa, sess)
+        await setSession(waKey, sess)
         await sendText(waRaw, 'Perfecto. En breve un operador te enviará el archivo o el enlace de descarga. ¡Gracias!', waKey)
       } else {
         sess = { state: 'idle', step: 0 }
-        await setSession(wa, sess)
+        await setSession(waKey, sess)
         await sendText(waRaw, 'Entendido. Si querés iniciar de nuevo, escribí: Envío de estudio', waKey)
       }
       return sess
     default:
       sess = { state: 'idle', step: 0 }
-      await setSession(wa, sess)
+      await setSession(waKey, sess)
       await sendText(waRaw, 'Listo. Si necesitás enviar un estudio, escribí: Envío de estudio', waKey)
       return sess
   }
@@ -174,7 +173,7 @@ async function routeIncomingMessage(waRaw, waKey, msg) {
 
   if (sess.state === 'envio_estudio') { await handleFlowEnvioEstudio(waRaw, waKey, sess, msg.text); return }
 
-  await sendText(wa, 'Hola 👋 Soy el asistente de i‑R Dental. Para solicitar tu estudio, escribí: \"Envío de estudio\".')
+  await sendText(waRaw, 'Hola 👋 Soy el asistente de i-R Dental. Para solicitar tu estudio, escribí: "Envío de estudio".', waKey)
 }
 
 // --- Handler ---
@@ -195,22 +194,20 @@ export default async function handler(req, res) {
       return res.status(200).json({ wa, messages: history })
     }
 
-   const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
+    // Lista de chats por score descendente (compat v1)
+    const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
 
-let items;
-// Upstash puede devolver dos formatos según versión:
-// 1) [{ member: 'wa', score: 123 }]  (moderno)
-// 2) ['wa1','123','wa2','456', ...]  (plano, alternado)
-if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object' && rows[0] !== null) {
-  // formato objetos
-  items = rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
-} else {
-  // formato alternado
-  items = []
-  for (let i = 0; i < rows.length; i += 2) items.push({ wa: rows[i], ts: Number(rows[i + 1]) })
-}
+    let items
+    if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object' && rows[0] !== null) {
+      // [{ member, score }]
+      items = rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
+    } else {
+      // ['member','score',...]
+      items = []
+      for (let i = 0; i < rows.length; i += 2) items.push({ wa: rows[i], ts: Number(rows[i + 1]) })
+    }
 
-return res.status(200).json({ chats: items })
+    return res.status(200).json({ chats: items })
   }
 
   // POST: WhatsApp webhook events
@@ -228,8 +225,8 @@ return res.status(200).json({ chats: items })
       flowLog('STATUSES', value.statuses); return res.status(200).json({ ok: true })
     }
 
-    const waIdRaw = value?.contacts?.[0]?.wa_id
-    const waKey = normalizeWaId(waIdRaw)
+    const waIdRaw = value?.contacts?.[0]?.wa_id           // crudo para enviar (549...)
+    const waKey   = normalizeWaId(waIdRaw)                // normalizado para guardar
 
     const msg = value?.messages?.[0]
     if (!waKey || !msg) { flowLog('MISSING_MSG', { wa: waIdRaw, hasMsg: !!msg }); return res.status(200).json({ ok: true }) }
@@ -247,7 +244,7 @@ return res.status(200).json({ chats: items })
     await appendMessage(waKey, { id: msg.id, from: waKey, direction: 'in', text: incomingText || `[${type}]`, ts })
 
     try { await routeIncomingMessage(waIdRaw, waKey, { id: msg.id, text: incomingText, ts }) }
-    catch (e) { flowLog('ROUTE_ERR', { wa, err: String(e) }) }
+    catch (e) { flowLog('ROUTE_ERR', { wa: waKey, err: String(e) }) }
 
     return res.status(200).json({ ok: true })
   }
