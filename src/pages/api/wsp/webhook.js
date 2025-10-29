@@ -23,7 +23,30 @@ const {
   TEST_RECIPIENT_FORMAT = 'no9', // 'no9' | 'with9' | ''
 } = process.env
 
+
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+
+// --- Upstash v1 compat shim: si no existe zrevrange, lo mapeamos a zrange con rev:true
+if (typeof redis.zrevrange !== 'function') {
+  redis.zrevrange = async (key, start, stop, opts = {}) => {
+    // Upstash v1 acepta { withScores: true } y también puede devolver
+    // formato objeto [{member, score}] o alternado ['member','score',...]
+    return await redis.zrange(key, start, stop, { ...opts, rev: true })
+  }
+}
+
+const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
+
+let items
+if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object') {
+  items = rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
+} else {
+  items = []
+  for (let i = 0; i < rows.length; i += 2) {
+    items.push({ wa: rows[i], ts: Number(rows[i + 1]) })
+  }
+}
+return res.status(200).json({ chats: items })
 
 // --- Helpers ---
 function flowLog(tag, obj) { console.log(`FLOW_${tag} →`, typeof obj === 'string' ? obj : JSON.stringify(obj)) }
