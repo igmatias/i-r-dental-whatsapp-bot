@@ -56,43 +56,13 @@ const TXT_ESTUDIOS = `🧾 Estudios i-R Dental:
 ✅ SIN TURNO, por orden de llegada.`;
 
 const TXT_OBRAS = `🧾 Obras sociales activas:
-• AMFFA
-• ANSSAL APDIS
-• APESA SALUD
-• CENTRO MEDICO PUEYRREDON
-• COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES
-• DASUTEN
-• DOCTHOS
-• ELEVAR*
-• ESPORA SALUD*
-• FATFA
-• FEMEBA AVELLANEDA
-• HOSPITAL BRITANICO
-• HOSPITAL ITALIANO
-• LUIS PASTEUR
-• MEDICUS*
-• NUBIAL
-• OMA
-• OMINT*
-• OSDE
-• OSDIPP
-• OSMEBA
-• OPSA
-• PODER JUDICIAL (en orden de Federación Odontológica)*
-• PROGRAMAS MEDICOS
-• QUALITAS
-• SANCOR SALUD*
-• SERVESALUD*
-• SETIA
-• SIMECO
-• SIND. MUNIC. AVELLANEDA
-• SWISS MEDICAL*
+AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANOS PROVINCIA DE BUENOS AIRES, DASUTEN, DOCTHOS, ELEVAR*, ESPORA SALUD*, FATFA, FEMEBA AVELLANEDA, HOSPITAL BRITANICO, HOSPITAL ITALIANO, LUIS PASTEUR, MEDICUS*, NUBIAL, OMA, OMINT*, OSDE, OSDIPP, OSMEBA, OPSA, PODER JUDICIAL (FO)*, PROGRAMAS MEDICOS, QUALITAS, SANCOR SALUD*, SERVESALUD*, SETIA, SIMECO, SIND. MUNIC. AVELLANEDA, SWISS MEDICAL*.
 
 (*) En la orden debe incluirse el Diagnóstico.
 
 ⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`;
 
-// ======== NORMALIZACIÓN (solo para pruebas) =========
+// ======== NORMALIZACIÓN (solo pruebas) =========
 // TEST_RECIPIENT_FORMAT en Vercel: "no9" | "with9"
 function toE164ArForTesting(raw) {
   let n = (raw || "").trim();
@@ -114,28 +84,36 @@ function toE164ArForTesting(raw) {
 
 // ======== HELPERS =========
 async function sendJson(to, payload) {
-  console.log("USING PHONE_ID:", process.env.WHATSAPP_PHONE_ID, "SENDING TO:", to);
-  const r = await fetch(API_URL(process.env.WHATSAPP_PHONE_ID), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      ...payload,
-    }),
-  });
-  const data = await r.json();
-  if (!r.ok) console.error("SEND ERROR", r.status, JSON.stringify(data));
-  else console.log("MESSAGE SENT →", to);
-  return { ok: r.ok, status: r.status, data };
+  try {
+    console.log("USING PHONE_ID:", process.env.WHATSAPP_PHONE_ID, "SENDING TO:", to);
+    const r = await fetch(API_URL(process.env.WHATSAPP_PHONE_ID), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        ...payload,
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error("SEND ERROR", r.status, JSON.stringify(data));
+    } else {
+      console.log("MESSAGE SENT →", to);
+    }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    console.error("SEND THROW", e);
+    return { ok: false, status: 0, data: { error: String(e) } };
+  }
 }
 
 const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
 
-// Botones: máximo 3 por mensaje (limitación WhatsApp)
+// Botones: máx 3 por mensaje (límite WhatsApp)
 async function sendButtons(to, body, buttons = []) {
   const btns = buttons.slice(0, 3).map((b) => ({
     type: "reply",
@@ -151,76 +129,21 @@ async function sendButtons(to, body, buttons = []) {
   });
 }
 
-async function sendMainMenuList(to) {
-  // Lista interactiva
-  return sendJson(to, {
-    type: "interactive",
-    interactive: {
-      type: "list",
-      header: { type: "text", text: "i-R Dental" },
-      body: { text: TXT_BIENVENIDA },
-      footer: { text: "Seleccioná una opción" },
-      action: {
-        button: "Abrir menú",
-        sections: [
-          {
-            title: "Opciones",
-            rows: [
-              { id: "MENU_INFO_GENERAL", title: "ℹ️ Información general" },
-              { id: "MENU_SEDES",        title: "📍 Información de sedes" },
-              { id: "MENU_ESTUDIOS",     title: "🧾 Estudios que realizamos" },
-              { id: "MENU_OBRAS",        title: "💳 Obras sociales activas" },
-              { id: "MENU_ENVIO",        title: "📤 Solicitar envío de un estudio" },
-              { id: "MENU_SUBIR_ORDEN",  title: "📎 Subir orden" },
-              { id: "MENU_OPERADOR",     title: "🗣️ Hablar con una persona" },
-            ],
-          },
-        ],
-      },
-    },
-  });
-}
-
-// Menú principal con botones (dos tandas)
+// Menú principal con botones (dos tandas para cubrir todo)
 async function sendMainMenuButtons(to) {
-  await sendButtons(to, "Menú rápido (1/2): elegí una opción", [
+  await sendButtons(to, "Menú (1/2): elegí una opción", [
     { id: "MENU_SEDES",    title: "📍 Sedes" },
     { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
-    { id: "MENU_OBRAS",    title: "💳 Obras" },
+    { id: "MENU_OBRAS",    title: "💳 Obras sociales" },
   ]);
-  await sendButtons(to, "Menú rápido (2/2): más opciones", [
+  await sendButtons(to, "Menú (2/2): más opciones", [
     { id: "MENU_ENVIO",       title: "📤 Envío de estudio" },
     { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
     { id: "MENU_OPERADOR",    title: "👤 Operador" },
   ]);
 }
 
-// Lista de sedes
-async function sendSedesList(to) {
-  return sendJson(to, {
-    type: "interactive",
-    interactive: {
-      type: "list",
-      header: { type: "text", text: "Sedes i-R Dental" },
-      body: { text: "Elegí una sede para ver dirección, contacto y cómo llegar." },
-      action: {
-        button: "Elegir sede",
-        sections: [
-          {
-            title: "Sedes",
-            rows: [
-              { id: "SEDE_QUILMES", title: "Quilmes — Olavarría 88" },
-              { id: "SEDE_AVELL",   title: "Avellaneda — 9 de Julio 64 — 2° A" },
-              { id: "SEDE_LOMAS",   title: "Lomas de Zamora — España 156 — PB" },
-            ],
-          },
-        ],
-      },
-    },
-  });
-}
-
-// Botones de sedes (complemento/fallback)
+// Botones de sedes
 async function sendSedesButtons(to) {
   return sendButtons(to, "Elegí una sede para ver dirección y contacto:", [
     { id: "SEDE_QUILMES", title: "Quilmes" },
@@ -267,32 +190,23 @@ export default async function handler(req, res) {
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // 1) Si es texto: bienvenida + LISTA + BOTONES
+      // 1) TEXTO: bienvenida + botones (SIN lista, para evitar bloqueos)
       if (type === "text") {
-        await sendText(from, `¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n${HOURS}\n\n${NO_TURNO}`);
-        await sendMainMenuList(from);    // lista
-        await sendMainMenuButtons(from); // además, botones
+        await sendText(from, TXT_BIENVENIDA);
+        await sendMainMenuButtons(from);
       }
 
-      // 2) Si es interactivo: manejar selección
+      // 2) INTERACTIVE (botones)
       if (type === "interactive") {
         const inter = msg.interactive;
         const buttonReply = inter?.button_reply;
-        const listReply = inter?.list_reply;
-        const selId = buttonReply?.id || listReply?.id || "";
+        const selId = buttonReply?.id || "";
 
         switch (selId) {
           // ===== Menú principal =====
-          case "MENU_INFO_GENERAL":
-            await sendText(from, `${HOURS}\n\n${NO_TURNO}`);
-            await sendMainMenuButtons(from);
+          case "MENU_SEDES":
+            await sendSedesButtons(from);
             break;
-
-          case "MENU_SEDES": {
-            await sendSedesList(from);    // lista de sedes
-            await sendSedesButtons(from); // y también botones
-            break;
-          }
 
           case "MENU_ESTUDIOS":
             await sendText(from, TXT_ESTUDIOS);
@@ -372,15 +286,13 @@ export default async function handler(req, res) {
             ]);
             break;
 
-          // ===== Botón: volver al menú =====
+          // ===== Volver al menú =====
           case "BTN_BACK_MENU":
-            await sendMainMenuList(from);
             await sendMainMenuButtons(from);
             break;
 
           default:
             await sendText(from, "Te envío el menú nuevamente:");
-            await sendMainMenuList(from);
             await sendMainMenuButtons(from);
             break;
         }
