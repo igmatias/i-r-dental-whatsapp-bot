@@ -1,11 +1,11 @@
 // ==============================================
 // File: src/pages/api/wsp/webhook.js
-// Purpose: WhatsApp webhook + Operator feed (GET) + Operator SEND & SEND-MEDIA (POST)
+// Purpose: WhatsApp webhook + Operator feed (GET) + Operator SEND/MEDIA (POST)
 // Notes:
 //  - Redis Upstash: sesiones + historial (LPUSH/LRANGE) y zindex de chats
-//  - Botones/lista: soporta ids y titles (fallback)
-//  - Flujo “Envío de estudio” con pasos APELLIDO→…→CONFIRM
-//  - Feed robusto: busca variantes de clave (+54 / +549 / sin +)
+//  - Menú con botones/lista y flujo “Envío de estudio” robusto
+//  - Feed robusto: busca variantes de clave y usa SCAN fallback si hace falta
+//  - GET debug=1: lista claves candidatas encontradas en Redis
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -74,9 +74,7 @@ async function getSession(waKey) {
   try { return raw ? JSON.parse(raw) : { state: 'idle', step: 0 } }
   catch { return { state: 'idle', step: 0 } }
 }
-async function setSession(waKey, sess) {
-  return await redis.set(kSess(waKey), JSON.stringify(sess))
-}
+async function setSession(waKey, sess) { return await redis.set(kSess(waKey), JSON.stringify(sess)) }
 
 // --- Persistencia consola ---
 async function appendMessage(waKey, msg) {
@@ -87,7 +85,7 @@ async function appendMessage(waKey, msg) {
   flowLog('APPEND_MSG', { wa: key, dir: msg.direction, text: msg.text?.slice?.(0, 60), ts: msg.ts })
 }
 
-// --- FEED robusto: busca variantes de clave y mergea ---
+// --- FEED robusto: variantes + SCAN fallback ---
 async function getHistory(waKeyInput, limit = 100) {
   const raw = String(waKeyInput || '').trim()
   const withPlus = raw.startsWith('+') ? raw : `+${raw}`
@@ -95,24 +93,65 @@ async function getHistory(waKeyInput, limit = 100) {
   const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
   const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
 
-  const candidates = Array.from(new Set([
-    withPlus, noPlus, argentinaNo9, argentina9,
-  ])).filter(Boolean)
+  // variantes obvias
+  const candidates = Array.from(new Set([ withPlus, noPlus, argentinaNo9, argentina9 ])).filter(Boolean)
 
   let all = []
+  let hitKeys = []
+
+  // 1) Intento directo por variantes conocidas
   for (const key of candidates) {
     const k = key.startsWith('+') ? key : `+${key}`
     try {
       const arr = await redis.lrange(kMsgs(k), 0, limit - 1)
       const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) all = all.concat(parsed)
+      if (parsed.length) { all = all.concat(parsed); hitKeys.push(kMsgs(k)) }
     } catch (e) {
-      flowLog('FEED_HISTORY_ERR', { waTried: k, err: String(e) })
+      flowLog('FEED_HISTORY_ERR', { stage: 'variants', waTried: k, err: String(e) })
     }
   }
+
+  // 2) Fallback: si no encontró nada, SCAN de chat:*:messages
+  if (all.length === 0) {
+    try {
+      const digits = withPlus.replace(/\D/g, '')
+      const needleShort = digits.slice(-7)
+      const needleNo9   = digits.replace(/^549/, '54')
+      const needle9     = digits.replace(/^54(?!9)/, '549')
+
+      let cursor = 0
+      const MATCH = 'chat:*:messages'
+      do {
+        const res = await redis.scan(cursor, { match: MATCH, count: 200 })
+        cursor = Number(res[0]) || 0
+        const keys = res[1] || []
+        for (const key of keys) {
+          const keyS = String(key)
+          if (
+            keyS.includes(needleShort) ||
+            keyS.includes(needleNo9)   ||
+            keyS.includes(needle9)     ||
+            keyS.includes(withPlus.replace('+','')) ||
+            keyS.includes(noPlus)
+          ) {
+            try {
+              const arr = await redis.lrange(keyS, 0, limit - 1)
+              const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+              if (parsed.length) { all = all.concat(parsed); hitKeys.push(keyS) }
+            } catch (e) {
+              flowLog('FEED_HISTORY_ERR', { stage: 'scan-read', key: keyS, err: String(e) })
+            }
+          }
+        }
+      } while (cursor !== 0)
+    } catch (e) {
+      flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) })
+    }
+  }
+
   all.sort((a, b) => (a.ts || 0) - (b.ts || 0))
   if (all.length > limit) all = all.slice(-limit)
-  flowLog('FEED_HISTORY_MERGE', { wa: withPlus, variants: candidates, total: all.length })
+  flowLog('FEED_HISTORY_MERGE', { wa: withPlus, variants: candidates, total: all.length, hitKeys })
   return all
 }
 
@@ -468,6 +507,39 @@ export default async function handler(req, res) {
     if (secret !== OPERATOR_SECRET) return res.status(401).json({ error:'unauthorized' })
 
     if (wa) {
+      // modo debug opcional: lista posibles claves candidatas en Redis
+      if (req.query.debug === '1') {
+        try {
+          const keys = []
+          let cursor = 0
+          do {
+            const resScan = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 })
+            cursor = Number(resScan[0]) || 0
+            const k = resScan[1] || []
+            keys.push(...k)
+          } while (cursor !== 0)
+
+          const raw = String(wa || '').trim()
+          const withPlus = raw.startsWith('+') ? raw : `+${raw}`
+          const digits = withPlus.replace(/\D/g, '')
+          const needleShort = digits.slice(-7)
+          const needleNo9   = digits.replace(/^549/, '54')
+          const needle9     = digits.replace(/^54(?!9)/, '549')
+
+          const candidates = keys.filter(k =>
+            k.includes(needleShort) ||
+            k.includes(needleNo9) ||
+            k.includes(needle9) ||
+            k.includes(withPlus.replace('+','')) ||
+            k.includes(withPlus)
+          )
+
+          return res.status(200).json({ wa, debug: { keysCount: keys.length, candidates } })
+        } catch (e) {
+          return res.status(500).json({ wa, debugError: String(e) })
+        }
+      }
+
       const history = await getHistory(wa, parseInt(limit,10) || 100)
       flowLog('FEED_HISTORY', { wa, count: history?.length || 0, last: history?.[history.length - 1] })
       return res.status(200).json({ wa, messages: history })
