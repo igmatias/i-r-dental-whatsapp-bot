@@ -135,9 +135,9 @@ async function sendJson(to, payload) {
 
 const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
 
+// Botones: máximo 3 por mensaje (limitación WhatsApp)
 async function sendButtons(to, body, buttons = []) {
-  // Botones: [{ id, title }, ...]
-  const btns = buttons.map((b) => ({
+  const btns = buttons.slice(0, 3).map((b) => ({
     type: "reply",
     reply: { id: b.id, title: b.title },
   }));
@@ -151,12 +151,13 @@ async function sendButtons(to, body, buttons = []) {
   });
 }
 
-async function sendMainMenu(to) {
+async function sendMainMenuList(to) {
+  // Lista interactiva (puede fallar en cuentas nuevas, o fuera de ventana)
   return sendJson(to, {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "i-R Dental" }, // header sí admite 'type'
+      header: { type: "text", text: "i-R Dental" }, // header admite 'type'
       body: { text: TXT_BIENVENIDA },               // sin 'type'
       footer: { text: "Seleccioná una opción" },    // sin 'type'
       action: {
@@ -178,6 +179,20 @@ async function sendMainMenu(to) {
       },
     },
   });
+}
+
+// Fallback del menú en 2 tandas de botones (3 + 3)
+async function sendMainMenuButtonsFallback(to) {
+  await sendButtons(to, "Menú rápido (1/2): elegí una opción", [
+    { id: "MENU_SEDES",    title: "📍 Sedes" },
+    { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
+    { id: "MENU_OBRAS",    title: "💳 Obras" },
+  ]);
+  await sendButtons(to, "Menú rápido (2/2): más opciones", [
+    { id: "MENU_ENVIO",       title: "📤 Envío de estudio" },
+    { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
+    { id: "MENU_OPERADOR",    title: "👤 Operador" },
+  ]);
 }
 
 async function sendSedesList(to) {
@@ -242,10 +257,14 @@ export default async function handler(req, res) {
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // 1) TEXTO: siempre enviar texto y luego menú (fallback si la lista falla)
+      // 1) TEXTO: siempre texto y luego intento de lista; si falla, botones
       if (type === "text") {
         await sendText(from, `¡Hola! 👋 Gracias por escribirnos a i-R Dental.\n\n${HOURS}\n\n${NO_TURNO}`);
-        await sendMainMenu(from);
+        const listResp = await sendMainMenuList(from);
+        if (!listResp.ok) {
+          console.log("LIST FALLBACK → sending buttons");
+          await sendMainMenuButtonsFallback(from);
+        }
       }
 
       // 2) INTERACTIVE (botones/lista)
@@ -259,29 +278,38 @@ export default async function handler(req, res) {
           // ===== Menú principal =====
           case "MENU_INFO_GENERAL":
             await sendText(from, `${HOURS}\n\n${NO_TURNO}`);
-            await sendButtons(from, "¿Querés hacer otra consulta?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
-            ]);
+            await sendMainMenuButtonsFallback(from);
             break;
 
-          case "MENU_SEDES":
-            await sendSedesList(from);
+          case "MENU_SEDES": {
+            const r = await sendSedesList(from);
+            if (!r.ok) {
+              // fallback de sedes: texto + botones volver/operador
+              await sendText(from, `Sedes:\n• Quilmes — Olavarría 88\n• Avellaneda — 9 de Julio 64 — 2° A\n• Lomas de Zamora — España 156 — PB\n\nPedime la que quieras y te paso la info.`);
+              await sendButtons(from, "¿Querés volver al menú?", [
+                { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+                { id: "MENU_OPERADOR", title: "👤 Operador" },
+                { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
+              ]);
+            }
             break;
+          }
 
           case "MENU_ESTUDIOS":
             await sendText(from, TXT_ESTUDIOS);
             await sendButtons(from, "¿Algo más?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_OBRAS",    title: "💳 Obras" },
             ]);
             break;
 
           case "MENU_OBRAS":
             await sendText(from, TXT_OBRAS);
-            await sendButtons(from, "¿Querés volver al menú o hablar con un operador?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+            await sendButtons(from, "¿Querés otra opción?", [
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_ENVIO",    title: "📤 Envío" },
             ]);
             break;
 
@@ -294,8 +322,9 @@ export default async function handler(req, res) {
               "Un/a operador/a lo gestionará a la brevedad. 🙌"
             );
             await sendButtons(from, "¿Querés volver al menú?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_SUBIR_ORDEN", title: "📎 Subir orden" },
             ]);
             break;
 
@@ -306,51 +335,59 @@ export default async function handler(req, res) {
               "Un/a operador/a te responderá con la confirmación y pasos a seguir."
             );
             await sendButtons(from, "¿Querés volver al menú?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
-              { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "BTN_BACK_MENU",  title: "↩️ Menú" },
+              { id: "MENU_OPERADOR",  title: "👤 Operador" },
+              { id: "MENU_ESTUDIOS",  title: "🧾 Estudios" },
             ]);
             break;
 
           case "MENU_OPERADOR":
-            await sendText(
-              from,
-              "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil."
-            );
+            await sendText(from, "🗣️ Te derivamos con un/a asistente. Si escribiste fuera de horario, respondemos a primera hora hábil.");
             break;
 
           // ===== Submenú sedes =====
           case "SEDE_QUILMES":
             await sendText(from, sedeInfo("QUILMES"));
             await sendButtons(from, "¿Querés otra opción?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_ESTUDIOS", title: "🧾 Estudios" },
             ]);
             break;
 
           case "SEDE_AVELL":
             await sendText(from, sedeInfo("AVELL"));
             await sendButtons(from, "¿Querés otra opción?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_OBRAS",    title: "💳 Obras" },
             ]);
             break;
 
           case "SEDE_LOMAS":
             await sendText(from, sedeInfo("LOMAS"));
             await sendButtons(from, "¿Querés otra opción?", [
-              { id: "BTN_BACK_MENU", title: "↩️ Volver al menú" },
+              { id: "BTN_BACK_MENU", title: "↩️ Menú" },
               { id: "MENU_OPERADOR", title: "👤 Operador" },
+              { id: "MENU_ENVIO",    title: "📤 Envío" },
             ]);
             break;
 
           // ===== Botón: volver al menú =====
           case "BTN_BACK_MENU":
-            await sendMainMenu(from);
+            // Intento de lista; si falla, botones
+            {
+              const r = await sendMainMenuList(from);
+              if (!r.ok) await sendMainMenuButtonsFallback(from);
+            }
             break;
 
           default:
             await sendText(from, "Te envío el menú nuevamente:");
-            await sendMainMenu(from);
+            {
+              const r = await sendMainMenuList(from);
+              if (!r.ok) await sendMainMenuButtonsFallback(from);
+            }
             break;
         }
       }
