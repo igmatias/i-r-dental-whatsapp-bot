@@ -50,6 +50,14 @@ function normalizeWaId(waId) {
   return id
 }
 
+async function getSession(waKey) {
+  const raw = await redis.get(kSess(waKey))
+  try { return raw ? JSON.parse(raw) : { state: 'idle', step: 0 } } catch { return { state: 'idle', step: 0 } }
+}
+async function setSession(waKey, sess) {
+  return await redis.set(kSess(waKey), JSON.stringify(sess))
+}
+
 async function sendText(toRawDigits, body, storeKey) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
@@ -187,10 +195,22 @@ export default async function handler(req, res) {
       return res.status(200).json({ wa, messages: history })
     }
 
-    const chats = await redis.zrevrange(kChats, 0, 49, { withScores: true })
-    const items = []
-    for (let i = 0; i < chats.length; i += 2) items.push({ wa: chats[i], ts: Number(chats[i + 1]) })
-    return res.status(200).json({ chats: items })
+   const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
+
+let items;
+// Upstash puede devolver dos formatos según versión:
+// 1) [{ member: 'wa', score: 123 }]  (moderno)
+// 2) ['wa1','123','wa2','456', ...]  (plano, alternado)
+if (Array.isArray(rows) && rows.length && typeof rows[0] === 'object' && rows[0] !== null) {
+  // formato objetos
+  items = rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
+} else {
+  // formato alternado
+  items = []
+  for (let i = 0; i < rows.length; i += 2) items.push({ wa: rows[i], ts: Number(rows[i + 1]) })
+}
+
+return res.status(200).json({ chats: items })
   }
 
   // POST: WhatsApp webhook events
