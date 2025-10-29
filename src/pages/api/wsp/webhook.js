@@ -1,4 +1,5 @@
 // src/pages/api/wsp/webhook.js
+import { STORE } from "../../../lib/store";
 
 const API_URL = (phoneId) => `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
@@ -100,11 +101,8 @@ async function sendJson(to, payload) {
       }),
     });
     const data = await r.json();
-    if (!r.ok) {
-      console.error("SEND ERROR", r.status, JSON.stringify(data));
-    } else {
-      console.log("MESSAGE SENT →", to);
-    }
+    if (!r.ok) console.error("SEND ERROR", r.status, JSON.stringify(data));
+    else console.log("MESSAGE SENT →", to);
     return { ok: r.ok, status: r.status, data };
   } catch (e) {
     console.error("SEND THROW", e);
@@ -112,7 +110,20 @@ async function sendJson(to, payload) {
   }
 }
 
-const sendText = (to, body) => sendJson(to, { type: "text", text: { body } });
+const sendText = async (to, body) => {
+  const resp = await sendJson(to, { type: "text", text: { body } });
+  // Log saliente para portal operador
+  safePush({
+    id: `out_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+    ts: Date.now(),
+    waFrom: to,
+    direction: "out",
+    type: "text",
+    body,
+    meta: { ok: resp.ok },
+  });
+  return resp;
+};
 
 // Botones (máx 3)
 async function sendButtons(to, body, buttons = []) {
@@ -120,7 +131,7 @@ async function sendButtons(to, body, buttons = []) {
     type: "reply",
     reply: { id: b.id, title: b.title },
   }));
-  return sendJson(to, {
+  const resp = await sendJson(to, {
     type: "interactive",
     interactive: {
       type: "button",
@@ -128,6 +139,17 @@ async function sendButtons(to, body, buttons = []) {
       action: { buttons: btns },
     },
   });
+  // Log saliente resumido
+  safePush({
+    id: `out_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+    ts: Date.now(),
+    waFrom: to,
+    direction: "out",
+    type: "interactive",
+    body,
+    meta: { ok: resp.ok, buttons: buttons.map((b) => b.id) },
+  });
+  return resp;
 }
 
 // Menú principal (botones, dos tandas)
@@ -167,8 +189,7 @@ ${NO_TURNO}`;
 }
 
 /** ========= FSM "ENVÍO DE ESTUDIO" =========
- * Guardamos estado en memoria (MVP). En Vercel serverless puede resetearse;
- * para producción conviene KV/DB. Para pruebas funciona bien.
+ * Store en memoria (MVP). Para persistir, luego pasamos a Sheets/DB.
  */
 const SESSIONS = new Map(); // key: from, value: { step, data, startedAt }
 
@@ -242,19 +263,7 @@ Sede: ${d.sede}
 Envío por: ${d.via}${d.via === "Email" ? ` (${d.email})` : ""}`;
 }
 
-// Notificación al operador (opcional)
-async function notifyOperator(d) {
-  const opTo = (process.env.OPERATOR_WA_TO || "").trim();
-  if (!opTo) return { ok: true }; // no configurado, solo salimos
-  const body = `📬 Nuevo pedido de envío de estudio
-
-${resumenEnvio(d)}
-
-Por favor solicitar el archivo a radiología y enviarlo al paciente.`;
-  return sendText(opTo, body);
-}
-
-// Render de siguiente paso
+// Render del siguiente paso del flujo
 async function promptNext(from) {
   const s = getSession(from);
   if (!s) return;
@@ -303,7 +312,7 @@ async function promptNext(from) {
   }
 }
 
-// Manejo de respuestas dentro del flujo
+// Manejo de respuestas texto dentro del flujo
 async function handleEnvioText(from, rawBody) {
   const s = getSession(from);
   if (!s) return false;
@@ -375,6 +384,7 @@ async function handleEnvioText(from, rawBody) {
   }
 }
 
+// Manejo de respuestas por botón dentro del flujo
 async function handleEnvioButton(from, btnId) {
   const s = getSession(from);
   if (!s) return false;
@@ -417,8 +427,6 @@ async function handleEnvioButton(from, btnId) {
 
     case "CONFIRM":
       if (btnId === "EV_CONFIRM_YES") {
-        // Notificar operador y cerrar
-        await notifyOperator(s.data);
         await sendText(from, "✅ Recibimos tu solicitud. Un/a operador/a la gestionará a la brevedad.");
         endEnvioFlow(from);
         await sendButtons(from, "¿Querés volver al menú o hablar con un operador?", [
@@ -438,6 +446,13 @@ async function handleEnvioButton(from, btnId) {
     default:
       return false;
   }
+}
+
+/** ========= UTIL: push seguro al STORE ========= **/
+function safePush(msg) {
+  try {
+    if (STORE && typeof STORE.push === "function") STORE.push(msg);
+  } catch {}
 }
 
 /** ========= HANDLER ========= **/
@@ -460,10 +475,36 @@ export default async function handler(req, res) {
       console.log("WEBHOOK BODY:", JSON.stringify(body));
 
       const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-      if (!msg) return res.status(200).json({ ok: true });
+      if (!msg) return res.status(200).json({ ok: true }); // puede ser status update
 
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
+
+      // Log entrante para portal operador
+      if (type === "text") {
+        const bodyIn = msg.text?.body || "";
+        safePush({
+          id: `in_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+          ts: Date.now(),
+          waFrom: from,
+          direction: "in",
+          type: "text",
+          body: bodyIn,
+          meta: {},
+        });
+      }
+      if (type === "interactive") {
+        const selId = msg?.interactive?.button_reply?.id || msg?.interactive?.list_reply?.id || "";
+        safePush({
+          id: `in_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+          ts: Date.now(),
+          waFrom: from,
+          direction: "in",
+          type: "interactive",
+          body: selId,
+          meta: { raw: msg.interactive },
+        });
+      }
 
       /** --- Si hay flujo de envío activo, interceptamos primero --- **/
       if (type === "text" && getSession(from)) {
