@@ -1,7 +1,12 @@
 // src/pages/api/wsp/webhook.js
 import { getStore } from "../../../lib/store";
-const STORE = getStore();
+import {
+  getSession as rGet,
+  setSession as rSet,
+  delSession as rDel,
+} from "../../../lib/session"; // ← sesiones Redis (TTL)
 
+const STORE = getStore();
 const API_URL = (phoneId) => `https://graph.facebook.com/v20.0/${phoneId}/messages`;
 
 /** ========= TEXTOS BASE ========= **/
@@ -64,12 +69,12 @@ AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE ESCRIBANO
 
 ⚠️ Este listado puede presentar modificaciones. Por favor consulte telefónicamente, por mail o por WhatsApp con el operador.`;
 
-/** ========= NORMALIZACIÓN AR (pruebas) =========
- * TEST_RECIPIENT_FORMAT en Vercel: "no9" | "with9"
+/** ========= NORMALIZACIÓN AR (test) =========
+ * TEST_RECIPIENT_FORMAT: "no9" | "with9" (opcional para pruebas)
  */
 function toE164ArForTesting(raw) {
   let n = (raw || "").trim();
-  if (!n.startsWith("+")) n = "+" + n; // asegurar "+"
+  if (!n.startsWith("+")) n = "+" + n;
 
   const mode = (process.env.TEST_RECIPIENT_FORMAT || "").toLowerCase();
   if (mode === "no9" && /^\+54911\d{8}$/.test(n)) {
@@ -113,7 +118,6 @@ async function sendJson(to, payload) {
 
 const sendText = async (to, body) => {
   const resp = await sendJson(to, { type: "text", text: { body } });
-  // Log saliente para portal operador
   safePush({
     id: `out_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
     ts: Date.now(),
@@ -126,7 +130,6 @@ const sendText = async (to, body) => {
   return resp;
 };
 
-// Botones (máx 3)
 async function sendButtons(to, body, buttons = []) {
   const btns = buttons.slice(0, 3).map((b) => ({
     type: "reply",
@@ -140,7 +143,6 @@ async function sendButtons(to, body, buttons = []) {
       action: { buttons: btns },
     },
   });
-  // Log saliente resumido
   safePush({
     id: `out_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
     ts: Date.now(),
@@ -153,7 +155,6 @@ async function sendButtons(to, body, buttons = []) {
   return resp;
 }
 
-// Menú principal (botones, dos tandas)
 async function sendMainMenuButtons(to) {
   await sendButtons(to, "Menú (1/2): elegí una opción", [
     { id: "MENU_SEDES",    title: "📍 Sedes" },
@@ -167,7 +168,6 @@ async function sendMainMenuButtons(to) {
   ]);
 }
 
-// Botones de sedes
 async function sendSedesButtons(to) {
   return sendButtons(to, "Elegí una sede para ver dirección y contacto:", [
     { id: "SEDE_QUILMES", title: "Quilmes" },
@@ -189,54 +189,11 @@ ${HOURS}
 ${NO_TURNO}`;
 }
 
-/** ========= FSM "ENVÍO DE ESTUDIO" =========
- * Store en memoria (MVP). Para persistir, luego pasamos a Sheets/DB.
- */
-const SESSIONS = new Map(); // key: from, value: { step, data, startedAt }
-
-const FLOW_STEPS = [
-  "APELLIDO",
-  "NOMBRE",
-  "DNI",
-  "FECHA_NAC",
-  "ESTUDIO",
-  "SEDE",
-  "VIA",
-  "EMAIL_IF_NEEDED",
-  "CONFIRM",
-];
-
-function startEnvioFlow(from) {
-  SESSIONS.set(from, {
-    step: "APELLIDO",
-    data: {
-      apellido: "",
-      nombre: "",
-      dni: "",
-      fechaNac: "",
-      estudio: "",
-      sede: "",
-      via: "",
-      email: "",
-    },
-    startedAt: Date.now(),
-  });
-}
-
-function endEnvioFlow(from) {
-  SESSIONS.delete(from);
-}
-
-function getSession(from) {
-  return SESSIONS.get(from);
-}
-
-// Validaciones básicas
+/** ========= VALIDACIONES ========= **/
 function isValidDni(s) {
   return /^[0-9]{6,9}$/.test((s || "").replace(/\D/g, ""));
 }
 function normalizeDate(s) {
-  // acepta DD/MM/AAAA o AAAA-MM-DD y devuelve AAAA-MM-DD si se puede
   const t = (s || "").trim();
   const ddmmyyyy = /^([0-3]?\d)\/([01]?\d)\/(\d{4})$/;
   const yyyymmdd = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -252,7 +209,6 @@ function normalizeDate(s) {
 function isValidEmail(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((s || "").trim());
 }
-
 function resumenEnvio(d) {
   return `📝 Solicitud de envío de estudio
 
@@ -264,9 +220,28 @@ Sede: ${d.sede}
 Envío por: ${d.via}${d.via === "Email" ? ` (${d.email})` : ""}`;
 }
 
-// Render del siguiente paso del flujo
+/** ========= SESIONES (Redis) ========= **/
+async function startEnvioFlow(from) {
+  await rSet(from, {
+    step: "APELLIDO",
+    data: {
+      apellido: "",
+      nombre: "",
+      dni: "",
+      fechaNac: "",
+      estudio: "",
+      sede: "",
+      via: "",
+      email: "",
+    },
+    startedAt: Date.now(),
+  });
+}
+async function endEnvioFlow(from) { await rDel(from); }
+async function getFlow(from) { return (await rGet(from)) || null; }
+
 async function promptNext(from) {
-  const s = getSession(from);
+  const s = await getFlow(from);
   if (!s) return;
 
   switch (s.step) {
@@ -313,15 +288,13 @@ async function promptNext(from) {
   }
 }
 
-// Manejo de respuestas texto dentro del flujo
 async function handleEnvioText(from, rawBody) {
-  const s = getSession(from);
+  const s = await getFlow(from);
   if (!s) return false;
 
   const body = (rawBody || "").trim();
-
   if (/^(cancelar|salir|menu|menú)$/i.test(body)) {
-    endEnvioFlow(from);
+    await endEnvioFlow(from);
     await sendText(from, "Se canceló la solicitud. Te dejo el menú:");
     await sendMainMenuButtons(from);
     return true;
@@ -331,12 +304,14 @@ async function handleEnvioText(from, rawBody) {
     case "APELLIDO":
       s.data.apellido = body.toUpperCase();
       s.step = "NOMBRE";
+      await rSet(from, s);
       await promptNext(from);
       return true;
 
     case "NOMBRE":
       s.data.nombre = body.toUpperCase();
       s.step = "DNI";
+      await rSet(from, s);
       await promptNext(from);
       return true;
 
@@ -348,6 +323,7 @@ async function handleEnvioText(from, rawBody) {
       }
       s.data.dni = digits;
       s.step = "FECHA_NAC";
+      await rSet(from, s);
       await promptNext(from);
       return true;
     }
@@ -360,6 +336,7 @@ async function handleEnvioText(from, rawBody) {
       }
       s.data.fechaNac = norm;
       s.step = "ESTUDIO";
+      await rSet(from, s);
       await promptNext(from);
       return true;
     }
@@ -367,6 +344,7 @@ async function handleEnvioText(from, rawBody) {
     case "ESTUDIO":
       s.data.estudio = body;
       s.step = "SEDE";
+      await rSet(from, s);
       await promptNext(from);
       return true;
 
@@ -377,6 +355,7 @@ async function handleEnvioText(from, rawBody) {
       }
       s.data.email = body.trim();
       s.step = "CONFIRM";
+      await rSet(from, s);
       await promptNext(from);
       return true;
 
@@ -385,13 +364,12 @@ async function handleEnvioText(from, rawBody) {
   }
 }
 
-// Manejo de respuestas por botón dentro del flujo
 async function handleEnvioButton(from, btnId) {
-  const s = getSession(from);
+  const s = await getFlow(from);
   if (!s) return false;
 
   if (btnId === "BTN_CANCEL_ENVIO") {
-    endEnvioFlow(from);
+    await endEnvioFlow(from);
     await sendText(from, "Se canceló la solicitud. Te dejo el menú:");
     await sendMainMenuButtons(from);
     return true;
@@ -407,6 +385,7 @@ async function handleEnvioButton(from, btnId) {
         return true;
       }
       s.step = "VIA";
+      await rSet(from, s);
       await promptNext(from);
       return true;
 
@@ -414,12 +393,14 @@ async function handleEnvioButton(from, btnId) {
       if (btnId === "EV_VIA_WSP") {
         s.data.via = "WhatsApp";
         s.step = "CONFIRM";
+        await rSet(from, s);
         await promptNext(from);
         return true;
       }
       if (btnId === "EV_VIA_EMAIL") {
         s.data.via = "Email";
         s.step = "EMAIL_IF_NEEDED";
+        await rSet(from, s);
         await promptNext(from);
         return true;
       }
@@ -429,7 +410,7 @@ async function handleEnvioButton(from, btnId) {
     case "CONFIRM":
       if (btnId === "EV_CONFIRM_YES") {
         await sendText(from, "✅ Recibimos tu solicitud. Un/a operador/a la gestionará a la brevedad.");
-        endEnvioFlow(from);
+        await endEnvioFlow(from);
         await sendButtons(from, "¿Querés volver al menú o hablar con un operador?", [
           { id: "BTN_BACK_MENU", title: "↩️ Menú" },
           { id: "MENU_OPERADOR", title: "👤 Operador" },
@@ -437,7 +418,7 @@ async function handleEnvioButton(from, btnId) {
         return true;
       }
       if (btnId === "EV_CONFIRM_NO") {
-        endEnvioFlow(from);
+        await endEnvioFlow(from);
         await sendText(from, "Solicitud cancelada. Te dejo el menú:");
         await sendMainMenuButtons(from);
         return true;
@@ -449,12 +430,9 @@ async function handleEnvioButton(from, btnId) {
   }
 }
 
-/** ========= UTIL: push seguro al STORE ========= **/
+/** ========= UTIL: LOG SEGURO ========= **/
 function safePush(msg) {
-  try {
-    const S = getStore();
-    S.push(msg);
-  } catch {}
+  try { getStore().push(msg); } catch {}
 }
 
 /** ========= HANDLER ========= **/
@@ -482,7 +460,7 @@ export default async function handler(req, res) {
       const from = toE164ArForTesting(msg.from);
       const type = msg.type;
 
-      // Log entrante para portal operador
+      // Log entrante básico
       if (type === "text") {
         const bodyIn = msg.text?.body || "";
         safePush({
@@ -508,19 +486,19 @@ export default async function handler(req, res) {
         });
       }
 
-      /** --- Si hay flujo de envío activo, interceptamos primero --- **/
-      if (type === "text" && getSession(from)) {
-        const consumed = await handleEnvioText(from, msg.text?.body || "");
-        if (consumed) return res.status(200).json({ ok: true });
-      }
-      if (type === "interactive" && getSession(from)) {
-        const btnId = msg?.interactive?.button_reply?.id || msg?.interactive?.list_reply?.id || "";
-        const consumed = await handleEnvioButton(from, btnId);
-        if (consumed) return res.status(200).json({ ok: true });
-      }
+      /** --- Flujo activo: interceptar ANTES de bienvenida --- **/
+      const flow = await getFlow(from);
 
-      /** --- Flujo normal (menú) --- **/
       if (type === "text") {
+        if (flow) {
+          const consumed = await handleEnvioText(from, msg.text?.body || "");
+          if (consumed) return res.status(200).json({ ok: true });
+          // Si por alguna razón no consumió, seguí al prompt actual:
+          await promptNext(from);
+          return res.status(200).json({ ok: true });
+        }
+
+        // Texto sin flujo → bienvenida + menú
         await sendText(from, TXT_BIENVENIDA);
         await sendMainMenuButtons(from);
         return res.status(200).json({ ok: true });
@@ -531,8 +509,13 @@ export default async function handler(req, res) {
         const buttonReply = inter?.button_reply;
         const selId = buttonReply?.id || "";
 
+        if (flow) {
+          const consumed = await handleEnvioButton(from, selId);
+          if (consumed) return res.status(200).json({ ok: true });
+        }
+
+        // --- Menú principal / submenús ---
         switch (selId) {
-          /** Menú principal **/
           case "MENU_SEDES":
             await sendSedesButtons(from);
             break;
@@ -556,7 +539,7 @@ export default async function handler(req, res) {
             break;
 
           case "MENU_ENVIO":
-            startEnvioFlow(from);
+            await startEnvioFlow(from);
             await sendText(from, "Vamos a tomar los datos para enviarte el estudio. Podés escribir **cancelar** en cualquier momento.");
             await promptNext(from); // pide APELLIDO
             break;
