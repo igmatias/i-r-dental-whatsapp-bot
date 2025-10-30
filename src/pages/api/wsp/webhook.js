@@ -90,25 +90,26 @@ async function getHistory(waInput, limit = 100) {
   const withPlus = raw.startsWith('+') ? raw : `+${raw}`
   const noPlus = withPlus.slice(1)
   const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
-  const argentina9 = withPlus.replace(/^\+54(?!9)/, '+549')
+  const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
 
   const exactListKey = kMsgs(withPlus)
   let all = []
   let hitKeys = []
 
-  // 0) Intento EXACTO primero (la misma clave a la que escribimos)
+  // 0) EXACTO primero (coerción de tipo en LLEN y fallback LRANGE incondicional)
   try {
-    const len = await redis.llen(exactListKey)
-    if (typeof len === 'number' && len > 0) {
-      const arr = await redis.lrange(exactListKey, 0, limit - 1)
-      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) { all = parsed; hitKeys.push(exactListKey) }
-    }
+    const lenRaw = await redis.llen(exactListKey)
+    const n = Number(lenRaw || 0)
+    // siempre probamos LRANGE igual, por si LLEN viene "raro"
+    const arr = await redis.lrange(exactListKey, 0, limit - 1)
+    const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+    if (parsed.length > 0) { all = parsed; hitKeys.push(exactListKey) }
+    flowLog('FEED_HISTORY_EXACT', { listKey: exactListKey, lenRaw, n, got: parsed.length })
   } catch (e) {
     flowLog('FEED_HISTORY_ERR', { stage: 'exact', listKey: exactListKey, err: String(e) })
   }
 
-  // 1) variantes directas si aún vacío
+  // 1) Variantes directas si aún vacío
   if (!all.length) {
     const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
     for (const v of variants) {
@@ -127,8 +128,8 @@ async function getHistory(waInput, limit = 100) {
     try {
       const digits = withPlus.replace(/\D/g, '')
       const needleShort = digits.slice(-7)
-      const needleNo9 = digits.replace(/^549/, '54')
-      const needle9 = digits.replace(/^54(?!9)/, '549')
+      const needleNo9   = digits.replace(/^549/, '54')
+      const needle9     = digits.replace(/^54(?!9)/, '549')
       let cursor = 0
       do {
         const [next, keys] = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 })
@@ -136,8 +137,11 @@ async function getHistory(waInput, limit = 100) {
         for (const listKey of (keys || [])) {
           const s = String(listKey)
           if (
-            s.includes(needleShort) || s.includes(needleNo9) || s.includes(needle9) ||
-            s.includes(withPlus.replace('+', '')) || s.includes(noPlus)
+            s.includes(needleShort) ||
+            s.includes(needleNo9)   ||
+            s.includes(needle9)     ||
+            s.includes(withPlus.replace('+','')) ||
+            s.includes(noPlus)
           ) {
             try {
               const arr = await redis.lrange(s, 0, limit - 1)
