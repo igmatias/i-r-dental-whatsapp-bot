@@ -4,12 +4,15 @@
 // - Menú interactivo con fallback numerado
 // - Flujo “Envío de estudio” completo
 // - Endpoints operador (send / send-media)
-// - GET ?probe=1 / ?debug=1 para diagnóstico
+// - GET ?probe=1 / ?debug=1 / ?ping=1 para diagnóstico
 // ==============================================
 
 import { Redis } from '@upstash/redis'
 
 export const config = { api: { bodyParser: false } }
+
+// --- VERSION / PING ---
+const VERSION = process.env.VERCEL_GIT_COMMIT_SHA || 'dev-local'
 
 // --- ENV ---
 const {
@@ -574,8 +577,17 @@ async function routeIncomingMessage(waRaw, wa, kind, payloadTextOrId, payloadTit
 
 // --- Handler ---
 export default async function handler(req, res) {
-  // GET: verificación Meta + feed operador
+  // GET: verificación Meta + feed operador + pings
   if (req.method === 'GET') {
+    // PING: confirmar build/version y features activas
+    if (req.query.ping === '1') {
+      return res.status(200).json({
+        ok: true,
+        version: VERSION,
+        features: { zsetFeed: true, listFeed: true, envioEstudioFlow: true }
+      })
+    }
+
     const mode = req.query['hub.mode']
     const token = req.query['hub.verify_token']
     const challenge = req.query['hub.challenge']
