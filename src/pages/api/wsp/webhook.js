@@ -5,7 +5,8 @@
 //  - Redis Upstash: sesiones + historial (LPUSH/LRANGE) y zindex de chats
 //  - Menú con botones/lista y flujo “Envío de estudio” robusto
 //  - Feed robusto: busca variantes de clave y usa SCAN fallback si hace falta
-//  - GET debug=1: lista claves candidatas encontradas en Redis
+//  - GET debug=1: lista claves candidatas encontradas en Redis (con conteos)
+//  - GET probe=1: escribe 2 mensajes de prueba y devuelve claves/lectura
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -76,83 +77,91 @@ async function getSession(waKey) {
 }
 async function setSession(waKey, sess) { return await redis.set(kSess(waKey), JSON.stringify(sess)) }
 
-// --- Persistencia consola ---
+// --- Persistencia consola (con verificación) ---
 async function appendMessage(waKey, msg) {
-  const key = ensurePlus(waKey)
-  await redis.lpush(kMsgs(key), JSON.stringify(msg))
-  await redis.ltrim(kMsgs(key), 0, 499)
-  await redis.zadd(kChats, { score: msg.ts || Date.now(), member: key })
-  flowLog('APPEND_MSG', { wa: key, dir: msg.direction, text: msg.text?.slice?.(0, 60), ts: msg.ts })
+  const key = ensurePlus(waKey);
+  const listKey = kMsgs(key);
+  const now = msg.ts || Date.now();
+  try {
+    const r1 = await redis.lpush(listKey, JSON.stringify({ ...msg, ts: now }));
+    await redis.ltrim(listKey, 0, 499);
+    const r3 = await redis.zadd(kChats, { score: now, member: key });
+    flowLog('APPEND_MSG', { wa: key, listKey, lenAfterLpush: r1, zadd: r3, dir: msg.direction, text: (msg.text||'').slice(0,60), ts: now });
+    return { ok: true, listKey };
+  } catch (e) {
+    flowLog('APPEND_ERR', { wa: key, listKey, err: String(e) });
+    return { ok: false, listKey, err: String(e) };
+  }
 }
 
-// --- FEED robusto: variantes + SCAN fallback ---
+// --- FEED robusto: variantes + SCAN fallback (devuelve mensajes y hitKeys) ---
 async function getHistory(waKeyInput, limit = 100) {
-  const raw = String(waKeyInput || '').trim()
-  const withPlus = raw.startsWith('+') ? raw : `+${raw}`
-  const noPlus   = withPlus.slice(1)
-  const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
-  const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
+  const raw = String(waKeyInput || '').trim();
+  const withPlus = raw.startsWith('+') ? raw : `+${raw}`;
+  const noPlus   = withPlus.slice(1);
+  const argentinaNo9 = withPlus.replace(/^\+549/, '+54');
+  const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549');
 
-  // variantes obvias
-  const candidates = Array.from(new Set([ withPlus, noPlus, argentinaNo9, argentina9 ])).filter(Boolean)
+  const candidates = Array.from(new Set([ withPlus, noPlus, argentinaNo9, argentina9 ])).filter(Boolean);
 
-  let all = []
-  let hitKeys = []
+  let all = [];
+  let hitKeys = [];
 
-  // 1) Intento directo por variantes conocidas
+  // 1) Variantes directas
   for (const key of candidates) {
-    const k = key.startsWith('+') ? key : `+${key}`
+    const k = key.startsWith('+') ? key : `+${key}`;
+    const listKey = kMsgs(k);
     try {
-      const arr = await redis.lrange(kMsgs(k), 0, limit - 1)
-      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) { all = all.concat(parsed); hitKeys.push(kMsgs(k)) }
+      const arr = await redis.lrange(listKey, 0, limit - 1);
+      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean);
+      if (parsed.length) { all = all.concat(parsed); hitKeys.push(listKey); }
     } catch (e) {
-      flowLog('FEED_HISTORY_ERR', { stage: 'variants', waTried: k, err: String(e) })
+      flowLog('FEED_HISTORY_ERR', { stage: 'variants', listKey, err: String(e) });
     }
   }
 
-  // 2) Fallback: si no encontró nada, SCAN de chat:*:messages
+  // 2) Fallback SCAN
   if (all.length === 0) {
     try {
-      const digits = withPlus.replace(/\D/g, '')
-      const needleShort = digits.slice(-7)
-      const needleNo9   = digits.replace(/^549/, '54')
-      const needle9     = digits.replace(/^54(?!9)/, '549')
+      const digits = withPlus.replace(/\D/g, '');
+      const needleShort = digits.slice(-7);
+      const needleNo9   = digits.replace(/^549/, '54');
+      const needle9     = digits.replace(/^54(?!9)/, '549');
 
-      let cursor = 0
-      const MATCH = 'chat:*:messages'
+      let cursor = 0;
+      const MATCH = 'chat:*:messages';
       do {
-        const res = await redis.scan(cursor, { match: MATCH, count: 200 })
-        cursor = Number(res[0]) || 0
-        const keys = res[1] || []
-        for (const key of keys) {
-          const keyS = String(key)
+        const res = await redis.scan(cursor, { match: MATCH, count: 200 });
+        cursor = Number(res[0]) || 0;
+        const keys = res[1] || [];
+        for (const listKey of keys) {
+          const s = String(listKey);
           if (
-            keyS.includes(needleShort) ||
-            keyS.includes(needleNo9)   ||
-            keyS.includes(needle9)     ||
-            keyS.includes(withPlus.replace('+','')) ||
-            keyS.includes(noPlus)
+            s.includes(needleShort) ||
+            s.includes(needleNo9)   ||
+            s.includes(needle9)     ||
+            s.includes(withPlus.replace('+','')) ||
+            s.includes(noPlus)
           ) {
             try {
-              const arr = await redis.lrange(keyS, 0, limit - 1)
-              const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-              if (parsed.length) { all = all.concat(parsed); hitKeys.push(keyS) }
+              const arr = await redis.lrange(s, 0, limit - 1);
+              const parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean);
+              if (parsed.length) { all = all.concat(parsed); hitKeys.push(s); }
             } catch (e) {
-              flowLog('FEED_HISTORY_ERR', { stage: 'scan-read', key: keyS, err: String(e) })
+              flowLog('FEED_HISTORY_ERR', { stage: 'scan-read', listKey: s, err: String(e) });
             }
           }
         }
-      } while (cursor !== 0)
+      } while (cursor !== 0);
     } catch (e) {
-      flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) })
+      flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) });
     }
   }
 
-  all.sort((a, b) => (a.ts || 0) - (b.ts || 0))
-  if (all.length > limit) all = all.slice(-limit)
-  flowLog('FEED_HISTORY_MERGE', { wa: withPlus, variants: candidates, total: all.length, hitKeys })
-  return all
+  all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  if (all.length > limit) all = all.slice(-limit);
+  flowLog('FEED_HISTORY_MERGE', { wa: withPlus, variants: candidates, total: all.length, hitKeys });
+  return { messages: all, hitKeys };
 }
 
 async function alreadyProcessed(waKey, messageId) {
@@ -247,49 +256,6 @@ const TXT_OBRAS = `💳 Obras sociales activas:
 AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE FARMACÉUTICOS, DASMI, DASUTeN, FEDERADA, GALENO*, IOMA*, IOSFA, MEDICUS*, OMINT*, OSDE*, OSECAC, OSPACA, OSPE, OSPERYHRA, PAMI, PREMEDIC, SIMECO, SWISS MEDICAL*.
 (*) Algunas con requisitos de orden/diagnóstico.
 ⚠️ Este listado puede cambiar. Consultá por WhatsApp, teléfono o mail.`
-
-async function sendMainMenuButtons(to, storeKey) {
-  await sendButtons(to, 'Menú (1/2): elegí una opción', [
-    { id:'MENU_SEDES',    title:'📍 Sedes' },
-    { id:'MENU_ESTUDIOS', title:'🧾 Estudios' },
-    { id:'MENU_OBRAS',    title:'💳 Obras sociales' },
-  ], storeKey)
-  await sendButtons(to, 'Menú (2/2): más opciones', [
-    { id:'MENU_ENVIO',       title:'📤 Envío de estudio' },
-    { id:'MENU_SUBIR_ORDEN', title:'📎 Subir orden' },
-    { id:'MENU_OPERADOR',    title:'👤 Operador' },
-  ], storeKey)
-}
-async function sendSedesButtons(to, storeKey) {
-  return sendButtons(to, 'Elegí una sede para ver dirección y contacto:', [
-    { id:'SEDE_QUILMES', title:'Quilmes' },
-    { id:'SEDE_AVELL',   title:'Avellaneda' },
-    { id:'SEDE_LOMAS',   title:'Lomas' },
-  ], storeKey)
-}
-function sedeInfo(key) {
-  const s = SEDES[key]
-  return `📍 ${s.title}
-Dirección: ${s.dir}
-Teléfono: ${s.tel}
-Email: ${s.mail}
-Cómo llegar: ${s.link}
-
-${HOURS}
-
-${NO_TURNO}`
-}
-
-// --- Validaciones ---
-function isValidDni(s) { return /^[0-9]{6,9}$/.test((s||'').replace(/\D/g,'')) }
-function normalizeDate(s) {
-  const t = (s||'').trim()
-  const ddmmyyyy = /^([0-3]?\d)\/([01]?\d)\/(\d{4})$/
-  const yyyymmdd = /^(\d{4})-(\d{2})-(\d{2})$/
-  if (ddmmyyyy.test(t)) { const [,d,m,y]=t.match(ddmmyyyy); return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}` }
-  if (yyyymmdd.test(t)) return t
-  return null
-}
 
 // --- Flujo "Envío de estudio" ---
 async function flowStart(waKey) {
@@ -451,6 +417,30 @@ async function routeMenuSelection(waRaw, waKey, selRaw) {
   return false
 }
 
+function sedeInfo(key) {
+  const s = SEDES[key]
+  return `📍 ${s.title}
+Dirección: ${s.dir}
+Teléfono: ${s.tel}
+Email: ${s.mail}
+Cómo llegar: ${s.link}
+
+${HOURS}
+
+${NO_TURNO}`
+}
+
+// --- Validaciones ---
+function isValidDni(s) { return /^[0-9]{6,9}$/.test((s||'').replace(/\D/g,'')) }
+function normalizeDate(s) {
+  const t = (s||'').trim()
+  const ddmmyyyy = /^([0-3]?\d)\/([01]?\d)\/(\d{4})$/
+  const yyyymmdd = /^(\d{4})-(\d{2})-(\d{2})$/
+  if (ddmmyyyy.test(t)) { const [,d,m,y]=t.match(ddmmyyyy); return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}` }
+  if (yyyymmdd.test(t)) return t
+  return null
+}
+
 // --- Bienvenida SIEMPRE si idle ---
 async function sendWelcome(waRaw, waKey) {
   await sendText(waRaw, '¡Hola! 👋 Soy el asistente de i-R Dental.', waKey)
@@ -507,24 +497,41 @@ export default async function handler(req, res) {
     if (secret !== OPERATOR_SECRET) return res.status(401).json({ error:'unauthorized' })
 
     if (wa) {
-      // modo debug opcional: lista posibles claves candidatas en Redis
+      const lim = parseInt(limit,10) || 100;
+
+      // PROBE: escribe y lee para ver claves reales
+      if (req.query.probe === '1') {
+        const now = Date.now();
+        const w = ensurePlus(wa);
+        const testIn  = await appendMessage(w, { id:`probe-in-${now}`,  from: w, direction:'in',  text:`[probe IN ${now}]`,  ts: now });
+        const testOut = await appendMessage(w, { id:`probe-out-${now}`, from: w, direction:'out', text:`[probe OUT ${now}]`, ts: now+1 });
+        const { messages, hitKeys } = await getHistory(w, lim);
+        return res.status(200).json({
+          wa: w,
+          probe: { wroteTo: [testIn.listKey, testOut.listKey], writeOk: !!(testIn.ok && testOut.ok) },
+          found: { hitKeys, count: messages.length },
+          sample: messages.slice(-3)
+        });
+      }
+
+      // DEBUG: lista candidatas y agrega conteos LRANGE
       if (req.query.debug === '1') {
         try {
-          const keys = []
-          let cursor = 0
+          const keys = [];
+          let cursor = 0;
           do {
-            const resScan = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 })
-            cursor = Number(resScan[0]) || 0
-            const k = resScan[1] || []
-            keys.push(...k)
-          } while (cursor !== 0)
+            const resScan = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 });
+            cursor = Number(resScan[0]) || 0;
+            const k = resScan[1] || [];
+            keys.push(...k);
+          } while (cursor !== 0);
 
-          const raw = String(wa || '').trim()
-          const withPlus = raw.startsWith('+') ? raw : `+${raw}`
-          const digits = withPlus.replace(/\D/g, '')
-          const needleShort = digits.slice(-7)
-          const needleNo9   = digits.replace(/^549/, '54')
-          const needle9     = digits.replace(/^54(?!9)/, '549')
+          const raw = String(wa || '').trim();
+          const withPlus = raw.startsWith('+') ? raw : `+${raw}`;
+          const digits = withPlus.replace(/\D/g, '');
+          const needleShort = digits.slice(-7);
+          const needleNo9   = digits.replace(/^549/, '54');
+          const needle9     = digits.replace(/^54(?!9)/, '549');
 
           const candidates = keys.filter(k =>
             k.includes(needleShort) ||
@@ -532,17 +539,27 @@ export default async function handler(req, res) {
             k.includes(needle9) ||
             k.includes(withPlus.replace('+','')) ||
             k.includes(withPlus)
-          )
+          );
 
-          return res.status(200).json({ wa, debug: { keysCount: keys.length, candidates } })
+          const counts = {};
+          for (const ck of candidates) {
+            try {
+              const arr = await redis.lrange(ck, 0, 2);
+              counts[ck] = Array.isArray(arr) ? arr.length : 0;
+            } catch (e) {
+              counts[ck] = `ERR ${String(e)}`;
+            }
+          }
+          return res.status(200).json({ wa: withPlus, debug: { keysCount: keys.length, candidates, counts } });
         } catch (e) {
-          return res.status(500).json({ wa, debugError: String(e) })
+          return res.status(500).json({ wa, debugError: String(e) });
         }
       }
 
-      const history = await getHistory(wa, parseInt(limit,10) || 100)
-      flowLog('FEED_HISTORY', { wa, count: history?.length || 0, last: history?.[history.length - 1] })
-      return res.status(200).json({ wa, messages: history })
+      // normal
+      const { messages, hitKeys } = await getHistory(wa, lim);
+      flowLog('FEED_HISTORY', { wa, count: messages?.length || 0, last: messages?.[messages.length - 1], hitKeys });
+      return res.status(200).json({ wa, messages });
     }
 
     const rows = await redis.zrange(kChats, 0, 49, { rev:true, withScores:true })
@@ -568,14 +585,14 @@ export default async function handler(req, res) {
 
       // Persistencia optimista
       const optimisticId = `out-local-${Date.now()}`
-      await appendMessage(wa, { id: optimisticId, from: wa, direction: 'out', text, ts: Date.now() })
+      await appendMessage(wa, { id: optimisticId, from: ensurePlus(wa), direction: 'out', text, ts: Date.now() })
 
-      let waRaw = await redis.get(kWaRaw(wa))
-      if (!waRaw) waRaw = wa.replace(/^\+/, '')
-      const r = await sendText(waRaw, text, wa)
+      let waRaw = await redis.get(kWaRaw(ensurePlus(wa)))
+      if (!waRaw) waRaw = ensurePlus(wa).replace(/^\+/, '')
+      const r = await sendText(waRaw, text, ensurePlus(wa))
 
       if (!r.ok) {
-        await appendMessage(wa, { id: `${optimisticId}-err`, from: wa, direction: 'out', text: `⚠️ Error envío: ${r.status}`, ts: Date.now() })
+        await appendMessage(wa, { id: `${optimisticId}-err`, from: ensurePlus(wa), direction: 'out', text: `⚠️ Error envío: ${r.status}`, ts: Date.now() })
       }
       return res.status(r.ok ? 200 : 500).json(r)
     }
@@ -588,17 +605,17 @@ export default async function handler(req, res) {
 
       // Persistencia optimista
       const optimisticId = `out-media-${Date.now()}`
-      await appendMessage(wa, { id: optimisticId, from: wa, direction: 'out', text: caption || `(${mediaType})`, ts: Date.now(), file: link })
+      await appendMessage(wa, { id: optimisticId, from: ensurePlus(wa), direction: 'out', text: caption || `(${mediaType})`, ts: Date.now(), file: link })
 
-      let waRaw = await redis.get(kWaRaw(wa))
-      if (!waRaw) waRaw = wa.replace(/^\+/, '')
+      let waRaw = await redis.get(kWaRaw(ensurePlus(wa)))
+      if (!waRaw) waRaw = ensurePlus(wa).replace(/^\+/, '')
 
       const r = mediaType === 'image'
-        ? await sendImage(waRaw, link, caption || '', wa)
-        : await sendDocument(waRaw, link, caption || '', wa)
+        ? await sendImage(waRaw, link, caption || '', ensurePlus(wa))
+        : await sendDocument(waRaw, link, caption || '', ensurePlus(wa))
 
       if (!r.ok) {
-        await appendMessage(wa, { id: `${optimisticId}-err`, from: wa, direction: 'out', text: `⚠️ Error envío media: ${r.status}`, ts: Date.now(), file: link })
+        await appendMessage(wa, { id: `${optimisticId}-err`, from: ensurePlus(wa), direction: 'out', text: `⚠️ Error envío media: ${r.status}`, ts: Date.now(), file: link })
       }
       return res.status(r.ok ? 200 : 500).json(r)
     }
