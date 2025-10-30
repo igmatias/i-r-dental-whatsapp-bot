@@ -5,6 +5,7 @@
 // - Flujo “Envío de estudio” completo
 // - Endpoints operador (send / send-media)
 // - GET ?probe=1 / ?debug=1 / ?ping=1 para diagnóstico
+// - appendMessage con métricas duras de escritura/lectura
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -81,7 +82,7 @@ async function flowStart(wa) {
 }
 async function flowEnd(wa) { await setSession(wa, { state: 'idle', step: 0 }) }
 
-// --- Persistencia de mensajes ---
+// --- Persistencia de mensajes (con métricas) ---
 async function appendMessage(waKey, msg) {
   const key = ensurePlus(waKey)
   const listKey = kMsgs(key)
@@ -89,23 +90,54 @@ async function appendMessage(waKey, msg) {
   const now = msg.ts || Date.now()
   const payload = JSON.stringify({ ...msg, ts: now })
 
+  const result = {
+    ok: false,
+    listKey, zKey,
+    ops: { lpush: null, ltrim: null, zadd: null, zremrangebyrank: null, zaddIndex: null },
+    after: { llen: null, zcard: null, lastZ: null },
+    err: null
+  }
+
   try {
-    // LIST (push + recorte)
-    const len = await redis.lpush(listKey, payload)
-    await redis.ltrim(listKey, 0, 499)
+    // LIST
+    const lpushRes = await redis.lpush(listKey, payload)
+    result.ops.lpush = Number(lpushRes ?? 0)
+    const ltrimRes = await redis.ltrim(listKey, 0, 499)
+    result.ops.ltrim = String(ltrimRes ?? 'ok')
 
-    // ZSET (robusto para lecturas recientes)
-    await redis.zadd(zKey, { score: now, member: payload })
-    await redis.zremrangebyrank(zKey, 0, -501)
+    // ZSET
+    const zaddRes = await redis.zadd(zKey, { score: now, member: payload })
+    result.ops.zadd = Number(typeof zaddRes === 'number' ? zaddRes : (zaddRes?.result ?? zaddRes ?? 0))
+    const zrrbRes = await redis.zremrangebyrank(zKey, 0, -501)
+    result.ops.zremrangebyrank = Number(zrrbRes ?? 0)
 
-    // índice global de chats
-    await redis.zadd(kChats, { score: now, member: key })
+    // Índice
+    const zaddIdx = await redis.zadd(kChats, { score: now, member: key })
+    result.ops.zaddIndex = Number(typeof zaddIdx === 'number' ? zaddIdx : (zaddIdx?.result ?? zaddIdx ?? 0))
 
-    flowLog('APPEND_MSG', { listKey, zKey, lenAfterLpush: len, dir: msg.direction, text: (msg.text||'').slice(0,60) })
-    return { ok: true, listKey, zKey }
+    // Lecturas de verificación
+    const llenAfter = await redis.llen(listKey)
+    result.after.llen = Number(llenAfter ?? 0)
+    const zcardAfter = await redis.zcard(zKey).catch(() => null)
+    result.after.zcard = Number(zcardAfter ?? 0)
+    const lastZ = await redis.zrange(zKey, -1, -1)
+    result.after.lastZ = (Array.isArray(lastZ) && lastZ[0]) ? 'ok' : 'empty'
+
+    result.ok = true
+
+    flowLog('APPEND_MSG', {
+      listKey, zKey,
+      lpushAfter: result.ops.lpush,
+      llenAfter: result.after.llen,
+      zcardAfter: result.after.zcard,
+      dir: msg.direction,
+      sample: (msg.text || '').slice(0, 50)
+    })
+    return result
   } catch (e) {
-    flowLog('APPEND_ERR', { listKey, zKey, err: String(e) })
-    return { ok: false, listKey, zKey, err: String(e) }
+    result.err = String(e)
+    flowLog('APPEND_ERR', { listKey, zKey, err: result.err })
+    return result
   }
 }
 
@@ -205,6 +237,15 @@ async function getHistory(waInput, limit = 100) {
         } while (cursor !== 0 && !all.length)
       } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) }) }
     }
+  }
+
+  // Fallback extremo: reintento directo a LIST exacta
+  if (!all.length) {
+    try {
+      const arr = await redis.lrange(kMsgs(withPlus), 0, limit - 1)
+      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+      if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(kMsgs(withPlus)) }
+    } catch {}
   }
 
   flowLog('FEED_HISTORY_MERGE', { wa: withPlus, total: all.length, hitKeys })
@@ -602,22 +643,28 @@ export default async function handler(req, res) {
     if (wa) {
       const lim = parseInt(limit, 10) || 100
 
-      // PROBE: escribe 2 mensajes y lee (para debug rápido)
+      // PROBE: escribe 2 mensajes, verifica escrituras y lee (debug fuerte)
       if (req.query.probe === '1') {
         const w = ensurePlus(wa)
         const now = Date.now()
+
         const a = await appendMessage(w, { id: `probe-in-${now}`,  from: w, direction: 'in',  text: `[probe IN ${now}]`,  ts: now })
         const b = await appendMessage(w, { id: `probe-out-${now}`, from: w, direction: 'out', text: `[probe OUT ${now}]`, ts: now + 1 })
-        // breve retry por consistencia eventual
-        let read
-        for (let i = 0; i < 3; i++) {
-          read = await getHistory(w, lim)
-          if ((read.messages || []).length) break
-          await new Promise(r => setTimeout(r, 120))
+
+        // backoff por consistencia eventual (10 * 250ms)
+        let read, tries = []
+        for (let i = 0; i < 10; i++) {
+          const r = await getHistory(w, lim)
+          tries.push({ i, count: (r.messages||[]).length, hitKeys: r.hitKeys })
+          if ((r.messages || []).length >= 2) { read = r; break }
+          await new Promise(r => setTimeout(r, 250))
         }
+        if (!read) read = await getHistory(w, lim)
+
         return res.status(200).json({
           wa: w,
-          probe: { wroteTo: [a.listKey, b.listKey], writeOk: !!(a.ok && b.ok) },
+          probe: { appendA: a, appendB: b },
+          tries,
           found: { hitKeys: read.hitKeys, count: (read.messages || []).length },
           sample: (read.messages || []).slice(-3),
         })
