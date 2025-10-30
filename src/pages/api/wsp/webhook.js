@@ -1,9 +1,10 @@
 // ==============================================
-// WhatsApp webhook + Operator feed (GET/POST) + fallbacks
-// - Upstash Redis (historial LPUSH/LRANGE, índice ZSET)
-// - Botones interactivos + fallback en texto numerado
-// - Flujo “Envío de estudio” con pasos
-// - GET debug=1 / probe=1 para diagnóstico rápido
+// i-R Dental - WhatsApp Webhook + Feed Operador
+// - Upstash Redis: historial LIST + ZSET por chat
+// - Menú interactivo con fallback numerado
+// - Flujo “Envío de estudio” completo
+// - Endpoints operador (send / send-media)
+// - GET ?probe=1 / ?debug=1 para diagnóstico
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -18,26 +19,27 @@ const {
   WSP_VERIFY_TOKEN,
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
-  TEST_RECIPIENT_FORMAT = 'no9', // 'no9' (sin 9) | 'with9' | ''
+  TEST_RECIPIENT_FORMAT = 'no9', // 'no9' | 'with9' | ''
 } = process.env
 
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
 
-// Compat: si no existe zrevrange, emular con zrange rev:true
+// Compat: Upstash sin zrevrange → emular con zrange rev:true
 if (typeof redis.zrevrange !== 'function') {
   redis.zrevrange = async (key, start, stop, opts = {}) => {
     return await redis.zrange(key, start, stop, { ...opts, rev: true })
   }
 }
 
-// --- Keys ---
-const kSess  = (wa) => `sess:${wa}`
-const kMsgs  = (wa) => `chat:${wa}:messages`
-const kSeen  = (wa) => `seen:${wa}`
-const kChats = 'chats:index'
-const kWaRaw = (wa) => `waid:${wa}`
+// --- Redis Keys ---
+const kSess   = (wa) => `sess:${wa}`
+const kMsgs   = (wa) => `chat:${wa}:messages`   // LIST
+const kMsgsZ  = (wa) => `chat:${wa}:z`          // ZSET (score=ts, member=payload)
+const kSeen   = (wa) => `seen:${wa}`            // id de mensaje procesado (idempotencia)
+const kChats  = 'chats:index'                   // ZSET índice de chats (score=last ts)
+const kWaRaw  = (wa) => `waid:${wa}`            // mapea +54... → 5411... usado por Meta
 
-// --- Util ---
+// --- Helpers ---
 const ensurePlus = (wa) => (wa?.startsWith('+') ? wa : `+${wa}`)
 function flowLog(tag, obj) { console.log(`FLOW_${tag} →`, typeof obj === 'string' ? obj : JSON.stringify(obj)) }
 async function readBody(req) {
@@ -55,7 +57,7 @@ function normalizeWaKey(waId) {
 }
 function sanitizeToE164NoPlus(rawDigits) {
   let to = String(rawDigits || '').replace(/\D/g, '')
-  if (to.startsWith('549')) to = '54' + to.slice(3) // quitar 9
+  if (to.startsWith('549')) to = '54' + to.slice(3) // quitar 9 para Arg
   return to
 }
 
@@ -66,100 +68,147 @@ async function getSession(wa) {
   catch { return { state: 'idle', step: 0 } }
 }
 async function setSession(wa, sess) { return redis.set(kSess(wa), JSON.stringify(sess)) }
+async function flowStart(wa) {
+  await setSession(wa, {
+    state: 'envio_estudio',
+    step: 'APELLIDO',
+    data: { apellido: '', nombre: '', dni: '', fechaNac: '', estudio: '', sede: '', via: '', email: '' },
+    startedAt: Date.now()
+  })
+}
+async function flowEnd(wa) { await setSession(wa, { state: 'idle', step: 0 }) }
 
 // --- Persistencia de mensajes ---
 async function appendMessage(waKey, msg) {
   const key = ensurePlus(waKey)
   const listKey = kMsgs(key)
+  const zKey    = kMsgsZ(key)
   const now = msg.ts || Date.now()
+  const payload = JSON.stringify({ ...msg, ts: now })
+
   try {
-    const len = await redis.lpush(listKey, JSON.stringify({ ...msg, ts: now }))
+    // LIST (push + recorte)
+    const len = await redis.lpush(listKey, payload)
     await redis.ltrim(listKey, 0, 499)
+
+    // ZSET (robusto para lecturas recientes)
+    await redis.zadd(zKey, { score: now, member: payload })
+    await redis.zremrangebyrank(zKey, 0, -501)
+
+    // índice global de chats
     await redis.zadd(kChats, { score: now, member: key })
-    flowLog('APPEND_MSG', { listKey, lenAfterLpush: len, dir: msg.direction, text: (msg.text||'').slice(0, 60) })
-    return { ok: true, listKey }
+
+    flowLog('APPEND_MSG', { listKey, zKey, lenAfterLpush: len, dir: msg.direction, text: (msg.text||'').slice(0,60) })
+    return { ok: true, listKey, zKey }
   } catch (e) {
-    flowLog('APPEND_ERR', { listKey, err: String(e) })
-    return { ok: false, listKey, err: String(e) }
+    flowLog('APPEND_ERR', { listKey, zKey, err: String(e) })
+    return { ok: false, listKey, zKey, err: String(e) }
   }
 }
 
-// --- Feed (exacto + variantes + SCAN) ---
+// --- Feed (ZSET → LIST → variantes → SCAN) ---
 async function getHistory(waInput, limit = 100) {
   const raw = String(waInput || '').trim()
   const withPlus = raw.startsWith('+') ? raw : `+${raw}`
-  const noPlus = withPlus.slice(1)
-  const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
-  const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
-
-  const exactListKey = kMsgs(withPlus)
+  const zKeyExact    = kMsgsZ(withPlus)
+  const listKeyExact = kMsgs(withPlus)
   let all = []
   let hitKeys = []
 
-  // 0) EXACTO primero (coerción de tipo en LLEN y fallback LRANGE incondicional)
+  // A) ZSET exacto (últimos N)
   try {
-    const lenRaw = await redis.llen(exactListKey)
-    const n = Number(lenRaw || 0)
-    // siempre probamos LRANGE igual, por si LLEN viene "raro"
-    const arr = await redis.lrange(exactListKey, 0, limit - 1)
-    const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-    if (parsed.length > 0) { all = parsed; hitKeys.push(exactListKey) }
-    flowLog('FEED_HISTORY_EXACT', { listKey: exactListKey, lenRaw, n, got: parsed.length })
+    const rows = await redis.zrange(zKeyExact, -limit, -1)     // de los últimos N por score
+    const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+    if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(zKeyExact) }
+    flowLog('FEED_HISTORY_Z', { zKeyExact, got: parsed.length })
   } catch (e) {
-    flowLog('FEED_HISTORY_ERR', { stage: 'exact', listKey: exactListKey, err: String(e) })
+    flowLog('FEED_HISTORY_ERR', { stage: 'z-exact', zKeyExact, err: String(e) })
   }
 
-  // 1) Variantes directas si aún vacío
+  // B) LIST exacta si ZSET vacío
   if (!all.length) {
-    const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
-    for (const v of variants) {
-      const k = v.startsWith('+') ? v : `+${v}`
-      const listKey = kMsgs(k)
-      try {
-        const arr = await redis.lrange(listKey, 0, limit - 1)
-        const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-        if (parsed.length) { all = all.concat(parsed); hitKeys.push(listKey) }
-      } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'variants', listKey, err: String(e) }) }
+    try {
+      const arr = await redis.lrange(listKeyExact, 0, limit - 1)
+      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+      if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKeyExact) }
+      flowLog('FEED_HISTORY_LIST', { listKeyExact, got: parsed.length })
+    } catch (e) {
+      flowLog('FEED_HISTORY_ERR', { stage: 'list-exact', listKeyExact, err: String(e) })
     }
   }
 
-  // 2) SCAN si nada
+  // C) Variantes + SCAN
   if (!all.length) {
-    try {
-      const digits = withPlus.replace(/\D/g, '')
-      const needleShort = digits.slice(-7)
-      const needleNo9   = digits.replace(/^549/, '54')
-      const needle9     = digits.replace(/^54(?!9)/, '549')
-      let cursor = 0
-      do {
-        const [next, keys] = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 })
-        cursor = Number(next) || 0
-        for (const listKey of (keys || [])) {
-          const s = String(listKey)
-          if (
-            s.includes(needleShort) ||
-            s.includes(needleNo9)   ||
-            s.includes(needle9)     ||
-            s.includes(withPlus.replace('+','')) ||
-            s.includes(noPlus)
-          ) {
-            try {
-              const arr = await redis.lrange(s, 0, limit - 1)
-              const parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
-              if (parsed.length) { all = all.concat(parsed); hitKeys.push(s) }
-            } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan-read', listKey: s, err: String(e) }) }
+    const noPlus       = withPlus.slice(1)
+    const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
+    const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
+    const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
+
+    // 1) ZSET variantes
+    for (const v of variants) {
+      if (all.length) break
+      const zKey = kMsgsZ(v.startsWith('+') ? v : `+${v}`)
+      try {
+        const rows = await redis.zrange(zKey, -limit, -1)
+        const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+        if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(zKey) }
+      } catch {}
+    }
+
+    // 2) LIST variantes
+    if (!all.length) {
+      for (const v of variants) {
+        const listKey = kMsgs(v.startsWith('+') ? v : `+${v}`)
+        try {
+          const arr = await redis.lrange(listKey, 0, limit - 1)
+          const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+          if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKey); break }
+        } catch {}
+      }
+    }
+
+    // 3) SCAN (busca :z y :messages)
+    if (!all.length) {
+      try {
+        const digits = withPlus.replace(/\D/g, '')
+        const needleShort = digits.slice(-7)
+        const needleNo9   = digits.replace(/^549/, '54')
+        const needle9     = digits.replace(/^54(?!9)/, '549')
+        let cursor = 0
+        do {
+          const [next, keys] = await redis.scan(cursor, { match: 'chat:*', count: 200 })
+          cursor = Number(next) || 0
+          for (const k of (keys || [])) {
+            const s = String(k)
+            if (s.endsWith(':z') || s.endsWith(':messages')) {
+              if (
+                s.includes(needleShort) || s.includes(needleNo9) || s.includes(needle9) ||
+                s.includes(withPlus.replace('+','')) || s.includes(noPlus)
+              ) {
+                try {
+                  let parsed = []
+                  if (s.endsWith(':z')) {
+                    const rows = await redis.zrange(s, -limit, -1)
+                    parsed = (rows || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  } else {
+                    const arr = await redis.lrange(s, 0, limit - 1)
+                    parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  }
+                  if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(s); break }
+                } catch {}
+              }
+            }
           }
-        }
-      } while (cursor !== 0)
-    } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) }) }
+        } while (cursor !== 0 && !all.length)
+      } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) }) }
+    }
   }
 
-  all.sort((a, b) => (a.ts || 0) - (b.ts || 0))
-  if (all.length > limit) all = all.slice(-limit)
   flowLog('FEED_HISTORY_MERGE', { wa: withPlus, total: all.length, hitKeys })
   return { messages: all, hitKeys }
 }
 
+// --- Idempotencia ---
 async function alreadyProcessed(wa, messageId) {
   const last = await redis.get(kSeen(wa))
   if (last === messageId) return true
@@ -167,7 +216,7 @@ async function alreadyProcessed(wa, messageId) {
   return false
 }
 
-// --- Envío a WhatsApp (con fallback y detección de error en body) ---
+// --- Envío a WhatsApp ---
 async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
@@ -182,10 +231,10 @@ async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
   })
   let data = {}
   try { data = await res.json() } catch {}
-  const ok = res.ok && !data?.error // <<—— IMPORTANTE: 200 con error en body => ok=false
+  const ok = res.ok && !data?.error
   flowLog(label, { to, status: res.status, ok, data })
 
-  // snapshot OUT para consola
+  // snapshot OUT para consola (texto + posibles botones)
   try {
     const outId = data?.messages?.[0]?.id || `out-${Date.now()}`
     const snap = { id: outId, from: storeKey, direction: 'out', ts: Date.now() }
@@ -207,7 +256,6 @@ async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
 
   return { ok, status: res.status, data }
 }
-
 const sendText = (to, body, storeKey) =>
   sendJson(to, { type: 'text', text: { body } }, storeKey, 'SEND_TEXT')
 
@@ -224,6 +272,7 @@ const sendMenuTextFallback = async (to, storeKey) => {
 Respondé con el número de la opción.`
   await sendText(to, text, storeKey)
 }
+
 const sendButtons = async (to, body, buttons, storeKey) => {
   const payload = {
     type: 'interactive',
@@ -239,29 +288,30 @@ const sendButtons = async (to, body, buttons, storeKey) => {
     }
   }
   const r = await sendJson(to, payload, storeKey, 'SEND_BUTTONS')
-  if (!r.ok) await sendMenuTextFallback(to, storeKey) // << fallback seguro
+  if (!r.ok) await sendMenuTextFallback(to, storeKey)
   return r
 }
+
 const sendList = async (to, body, sections, storeKey) => {
   const r = await sendJson(to, { type: 'interactive', interactive: { type: 'list', body: { text: body || '' }, action: { button: 'Ver opciones', sections } } }, storeKey, 'SEND_LIST')
   if (!r.ok) await sendMenuTextFallback(to, storeKey)
   return r
 }
 
-// --- Textos base ---
+// --- Textos/Contenido ---
 const HOURS = `🕒 Horarios (todas las sedes)
 • Lunes a viernes: 09:00 a 17:30
 • Sábados: 09:00 a 12:30`
 const NO_TURNO = `📌 Atención SIN TURNO, por orden de llegada.`
 const LINKS = {
   QUILMES: 'https://maps.google.com/?q=i-R+Dental+Quilmes',
-  AVELL: 'https://maps.google.com/?q=i-R+Dental+Avellaneda',
-  LOMAS: 'https://maps.google.com/?q=i-R+Dental+Lomas',
+  AVELL:   'https://maps.google.com/?q=i-R+Dental+Avellaneda',
+  LOMAS:   'https://maps.google.com/?q=i-R+Dental+Lomas',
 }
 const SEDES = {
   QUILMES: { title: 'Sede Quilmes — i-R Dental', dir: 'Moreno 851 — 1° B', tel: '4257-3638', mail: 'quilmes@irdental.com.ar', link: LINKS.QUILMES },
-  AVELL: { title: 'Sede Avellaneda — i-R Dental', dir: '9 de Julio 64 — 2° A', tel: '4222-5553', mail: 'avellaneda@irdental.com.ar', link: LINKS.AVELL },
-  LOMAS: { title: 'Sede Lomas de Zamora — i-R Dental', dir: 'España 156 — PB', tel: '4244-0148', mail: 'lomas@irdental.com.ar', link: LINKS.LOMAS },
+  AVELL:   { title: 'Sede Avellaneda — i-R Dental', dir: '9 de Julio 64 — 2° A', tel: '4222-5553', mail: 'avellaneda@irdental.com.ar', link: LINKS.AVELL },
+  LOMAS:   { title: 'Sede Lomas de Zamora — i-R Dental', dir: 'España 156 — PB', tel: '4244-0148', mail: 'lomas@irdental.com.ar', link: LINKS.LOMAS },
 }
 const TXT_ESTUDIOS = `🧾 Estudios i-R Dental:
 • Panorámica (OPG)
@@ -279,7 +329,7 @@ AMFFA, ANSSAL APDIS, APESA SALUD, CENTRO MEDICO PUEYRREDON, COLEGIO DE FARMACÉU
 (*) Algunas con requisitos de orden/diagnóstico.
 ⚠️ Este listado puede cambiar. Consultá por WhatsApp, teléfono o mail.`
 
-// --- Validaciones ---
+// --- Validaciones flujo ---
 const isValidDni = (s) => /^[0-9]{6,9}$/.test((s || '').replace(/\D/g, ''))
 function normalizeDate(s) {
   const t = (s || '').trim()
@@ -291,11 +341,6 @@ function normalizeDate(s) {
 }
 
 // --- Flujo Envío de estudio ---
-async function flowStart(wa) {
-  await setSession(wa, { state: 'envio_estudio', step: 'APELLIDO', data: { apellido: '', nombre: '', dni: '', fechaNac: '', estudio: '', sede: '', via: '', email: '' }, startedAt: Date.now() })
-}
-async function flowEnd(wa) { await setSession(wa, { state: 'idle', step: 0 }) }
-
 async function promptNext(waRaw, wa) {
   const s = await getSession(wa)
   if (!s || s.state !== 'envio_estudio') return
@@ -308,12 +353,12 @@ async function promptNext(waRaw, wa) {
     case 'SEDE':
       await sendButtons(waRaw, 'Elegí la **sede** donde se realizó:', [
         { id: 'EV_SEDE_QUILMES', title: 'Quilmes' },
-        { id: 'EV_SEDE_AVELL', title: 'Avellaneda' },
-        { id: 'EV_SEDE_LOMAS', title: 'Lomas' },
+        { id: 'EV_SEDE_AVELL',   title: 'Avellaneda' },
+        { id: 'EV_SEDE_LOMAS',   title: 'Lomas' },
       ], wa); break
     case 'VIA':
       await sendButtons(waRaw, '¿Por dónde querés recibirlo?', [
-        { id: 'EV_VIA_WSP', title: 'WhatsApp' },
+        { id: 'EV_VIA_WSP',   title: 'WhatsApp' },
         { id: 'EV_VIA_EMAIL', title: 'Email' },
       ], wa); break
     case 'EMAIL_IF_NEEDED':
@@ -325,19 +370,25 @@ async function promptNext(waRaw, wa) {
         [{ id: 'EV_CONFIRM_YES', title: '✅ Confirmar' }, { id: 'EV_CONFIRM_NO', title: '❌ Cancelar' }], wa)
       break
     }
-    default: await flowEnd(wa); await sendText(waRaw, 'Listo. Si necesitás enviar un estudio, escribí: Envío de estudio', wa)
+    default:
+      await flowEnd(wa)
+      await sendText(waRaw, 'Listo. Si necesitás enviar un estudio, escribí: Envío de estudio', wa)
   }
 }
+
 async function handleEnvioText(waRaw, wa, rawBody) {
   const s = await getSession(wa)
   if (!s || s.state !== 'envio_estudio') return false
   const body = (rawBody || '').trim()
   if (/^(cancelar|salir|menu|menú)$/i.test(body)) {
-    await flowEnd(wa); await sendText(waRaw, 'Se canceló la solicitud. Te dejo el menú:', wa); await sendMainMenu(waRaw, wa); return true
+    await flowEnd(wa)
+    await sendText(waRaw, 'Se canceló la solicitud. Te dejo el menú:', wa)
+    await sendMainMenu(waRaw, wa)
+    return true
   }
   switch (s.step) {
-    case 'APELLIDO': s.data.apellido = body.toUpperCase(); s.step = 'NOMBRE'; await setSession(wa, s); await promptNext(waRaw, wa); return true
-    case 'NOMBRE':   s.data.nombre = body.toUpperCase();   s.step = 'DNI';    await setSession(wa, s); await promptNext(waRaw, wa); return true
+    case 'APELLIDO': s.data.apellido = body.toUpperCase(); s.step = 'NOMBRE';    await setSession(wa, s); await promptNext(waRaw, wa); return true
+    case 'NOMBRE':   s.data.nombre   = body.toUpperCase(); s.step = 'DNI';       await setSession(wa, s); await promptNext(waRaw, wa); return true
     case 'DNI': {
       const digits = body.replace(/\D/g, '')
       if (!isValidDni(digits)) { await sendText(waRaw, 'DNI no válido (6–9 dígitos).', wa); return true }
@@ -357,41 +408,39 @@ async function handleEnvioText(waRaw, wa, rawBody) {
   }
   return false
 }
+
 async function handleEnvioButton(waRaw, wa, btnIdOrTitle) {
   const s = await getSession(wa)
   if (!s || s.state !== 'envio_estudio') return false
   const sel = (btnIdOrTitle || '').toUpperCase()
   switch (s.step) {
     case 'SEDE':
-      if (/EV_SEDE_QUILMES|QUILMES/.test(sel)) { s.data.sede = 'quilmes'; s.step = 'VIA' }
-      else if (/EV_SEDE_AVELL|AVELLANEDA/.test(sel)) { s.data.sede = 'avellaneda'; s.step = 'VIA' }
-      else if (/EV_SEDE_LOMAS|LOMAS/.test(sel)) { s.data.sede = 'lomas'; s.step = 'VIA' }
+      if (/EV_SEDE_QUILMES|QUILMES/.test(sel))      { s.data.sede = 'quilmes';    s.step = 'VIA' }
+      else if (/EV_SEDE_AVELL|AVELLANEDA/.test(sel)){ s.data.sede = 'avellaneda'; s.step = 'VIA' }
+      else if (/EV_SEDE_LOMAS|LOMAS/.test(sel))     { s.data.sede = 'lomas';      s.step = 'VIA' }
       else { await sendText(waRaw, 'Elegí una opción de los botones, por favor.', wa); return true }
       await setSession(wa, s); await promptNext(waRaw, wa); return true
+
     case 'VIA':
-      if (/EV_VIA_WSP|WHATSAPP/.test(sel)) { s.data.via = 'WhatsApp'; s.step = 'CONFIRM' }
-      else if (/EV_VIA_EMAIL|EMAIL/.test(sel)) { s.data.via = 'Email'; s.step = 'EMAIL_IF_NEEDED' }
+      if (/EV_VIA_WSP|WHATSAPP/.test(sel))  { s.data.via = 'WhatsApp'; s.step = 'CONFIRM' }
+      else if (/EV_VIA_EMAIL|EMAIL/.test(sel)) { s.data.via = 'Email';    s.step = 'EMAIL_IF_NEEDED' }
       else { await sendText(waRaw, 'Elegí una opción de los botones, por favor.', wa); return true }
       await setSession(wa, s); await promptNext(waRaw, wa); return true
+
     case 'CONFIRM':
       if (/EV_CONFIRM_YES|CONFIRMAR|SI|SÍ|OK|CORRECTO/.test(sel)) {
         await sendText(waRaw, '✅ Recibimos tu solicitud. Un/a operador/a la gestionará a la brevedad.', wa)
-        await flowEnd(wa)
-        await sendMainMenu(waRaw, wa)
-        return true
+        await flowEnd(wa); await sendMainMenu(waRaw, wa); return true
       }
       if (/EV_CONFIRM_NO|CANCELAR/.test(sel)) {
-        await flowEnd(wa)
-        await sendText(waRaw, 'Solicitud cancelada. Te dejo el menú:', wa)
-        await sendMainMenu(waRaw, wa)
-        return true
+        await flowEnd(wa); await sendText(waRaw, 'Solicitud cancelada. Te dejo el menú:', wa); await sendMainMenu(waRaw, wa); return true
       }
       await sendText(waRaw, 'Elegí una opción de los botones, por favor.', wa); return true
   }
   return false
 }
 
-// --- Menú principal (botones + fallback texto) ---
+// --- Menú principal + fallback ---
 async function sendMainMenu(waRaw, wa) {
   const r1 = await sendButtons(waRaw, 'Menú (1/2): elegí una opción', [
     { id: 'MENU_SEDES',    title: '📍 Sedes' },
@@ -418,11 +467,11 @@ ${HOURS}
 ${NO_TURNO}`
 }
 
-// --- Router de menú + comandos numéricos ---
+// --- Router de menú + comandos numerados ---
 async function routeMenuSelection(waRaw, wa, selRaw) {
   const selUpper = (selRaw || '').toUpperCase()
 
-  // Mapear menús de texto (1..6) con espacios/ruido
+  // Mapear menús de texto (1..6) tolerante a espacios/puntos
   if (/^\s*1\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_SEDES')
   if (/^\s*2\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_ESTUDIOS')
   if (/^\s*3\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_OBRAS')
@@ -497,7 +546,7 @@ async function routeIncomingMessage(waRaw, wa, kind, payloadTextOrId, payloadTit
   if (!sess || sess.state === 'idle') {
     if (kind === 'text') {
       const t = (payloadTextOrId || '').toLowerCase()
-      const isCmd = /(envio|envío).*(estudio)/.test(t) || /^\s*[1-6]\s*$/.test(t) // << acepta espacios
+      const isCmd = /(envio|envío).*(estudio)/.test(t) || /^\s*[1-6]\s*$/.test(t)
       if (!isCmd) { await sendWelcome(waRaw, wa); return }
     }
   }
@@ -541,57 +590,73 @@ export default async function handler(req, res) {
     if (wa) {
       const lim = parseInt(limit, 10) || 100
 
-      // PROBE: escribe 2 mensajes de prueba y lee
+      // PROBE: escribe 2 mensajes y lee (para debug rápido)
       if (req.query.probe === '1') {
         const w = ensurePlus(wa)
         const now = Date.now()
-        const a = await appendMessage(w, { id: `probe-in-${now}`, from: w, direction: 'in', text: `[probe IN ${now}]`, ts: now })
+        const a = await appendMessage(w, { id: `probe-in-${now}`,  from: w, direction: 'in',  text: `[probe IN ${now}]`,  ts: now })
         const b = await appendMessage(w, { id: `probe-out-${now}`, from: w, direction: 'out', text: `[probe OUT ${now}]`, ts: now + 1 })
-        // pequeño reintento por consistencia eventual
+        // breve retry por consistencia eventual
         let read
         for (let i = 0; i < 3; i++) {
           read = await getHistory(w, lim)
           if ((read.messages || []).length) break
           await new Promise(r => setTimeout(r, 120))
         }
-        return res.status(200).json({ wa: w, probe: { wroteTo: [a.listKey, b.listKey], writeOk: !!(a.ok && b.ok) }, found: { hitKeys: read.hitKeys, count: read.messages.length }, sample: read.messages.slice(-3) })
+        return res.status(200).json({
+          wa: w,
+          probe: { wroteTo: [a.listKey, b.listKey], writeOk: !!(a.ok && b.ok) },
+          found: { hitKeys: read.hitKeys, count: (read.messages || []).length },
+          sample: (read.messages || []).slice(-3),
+        })
       }
 
-      // DEBUG: lista claves candidatas + conteos
+      // DEBUG: lista claves candidatas + conteos rápidos
       if (req.query.debug === '1') {
         try {
           const raw = String(wa || '').trim()
           const withPlus = raw.startsWith('+') ? raw : `+${raw}`
           const digits = withPlus.replace(/\D/g, '')
           const needleShort = digits.slice(-7)
-          const needleNo9 = digits.replace(/^549/, '54')
-          const needle9 = digits.replace(/^54(?!9)/, '549')
+          const needleNo9   = digits.replace(/^549/, '54')
+          const needle9     = digits.replace(/^54(?!9)/, '549')
 
           let cursor = 0, keys = []
           do {
-            const [next, k] = await redis.scan(cursor, { match: 'chat:*:messages', count: 200 })
+            const [next, k] = await redis.scan(cursor, { match: 'chat:*', count: 200 })
             cursor = Number(next) || 0; keys.push(...(k || []))
           } while (cursor !== 0)
 
           const candidates = keys.filter(k =>
+            k.endsWith(':z') || k.endsWith(':messages')
+          ).filter(k =>
             k.includes(needleShort) || k.includes(needleNo9) || k.includes(needle9) ||
             k.includes(withPlus.replace('+','')) || k.includes(withPlus)
           )
+
           const counts = {}
           for (const ck of candidates) {
-            try { const arr = await redis.lrange(ck, 0, 2); counts[ck] = Array.isArray(arr) ? arr.length : 0 }
-            catch (e) { counts[ck] = `ERR ${String(e)}` }
+            try {
+              if (ck.endsWith(':z')) {
+                const rows = await redis.zrange(ck, -3, -1)
+                counts[ck] = Array.isArray(rows) ? rows.length : 0
+              } else {
+                const arr = await redis.lrange(ck, 0, 2)
+                counts[ck] = Array.isArray(arr) ? arr.length : 0
+              }
+            } catch (e) { counts[ck] = `ERR ${String(e)}` }
           }
           return res.status(200).json({ wa: withPlus, debug: { keysCount: keys.length, candidates, counts } })
         } catch (e) { return res.status(500).json({ wa, debugError: String(e) }) }
       }
 
-      // normal
+      // Feed normal
       const { messages, hitKeys } = await getHistory(wa, lim)
       flowLog('FEED_HISTORY', { wa, count: messages?.length || 0, last: messages?.[messages.length - 1], hitKeys })
       return res.status(200).json({ wa, messages })
     }
 
+    // Lista de chats
     const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
     const items = Array.isArray(rows) && rows.length && typeof rows[0] === 'object'
       ? rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
@@ -619,7 +684,7 @@ export default async function handler(req, res) {
       return res.status(r.ok ? 200 : 500).json(r)
     }
 
-    // Operador: (opcional) media por link
+    // Operador: enviar media (link)
     if (json?.op === 'send-media') {
       const { secret, wa, mediaType, link, caption } = json || {}
       if (secret !== OPERATOR_SECRET) return res.status(401).json({ error: 'unauthorized' })
@@ -632,8 +697,8 @@ export default async function handler(req, res) {
       if (!waRaw) waRaw = ensurePlus(wa).replace(/^\+/, '')
 
       const payloadOk = mediaType === 'image'
-        ? await sendJson(waRaw, { type:'image', image:{ link, caption: caption||'' } }, ensurePlus(wa), 'SEND_IMG')
-        : await sendJson(waRaw, { type:'document', document:{ link, caption: caption||'' } }, ensurePlus(wa), 'SEND_DOC')
+        ? await sendJson(waRaw, { type: 'image',   image:   { link, caption: caption||'' } }, ensurePlus(wa), 'SEND_IMG')
+        : await sendJson(waRaw, { type: 'document', document:{ link, caption: caption||'' } }, ensurePlus(wa), 'SEND_DOC')
 
       if (!payloadOk.ok) await appendMessage(wa, { id: `${optimisticId}-err`, from: ensurePlus(wa), direction: 'out', text: `⚠️ Error envío media: ${payloadOk.status}`, ts: Date.now(), file: link })
       return res.status(payloadOk.ok ? 200 : 500).json(payloadOk)
@@ -646,6 +711,7 @@ export default async function handler(req, res) {
     const value = change?.value
     if (!value) return res.status(200).json({ ok: true })
 
+    // Status callbacks (delivered, read, etc.)
     if (Array.isArray(value.statuses) && value.statuses.length) {
       flowLog('STATUSES', value.statuses); return res.status(200).json({ ok: true })
     }
