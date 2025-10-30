@@ -6,6 +6,7 @@
 // - Endpoints operador (send / send-media)
 // - GET ?probe=1 / ?debug=1 / ?peek=1 / ?ping=1 (diagnóstico)
 // - appendMessage con métricas duras de escritura/lectura
+// - PARCHE: parseMaybe para valores devueltos como objeto por Upstash
 // ==============================================
 
 import { Redis } from '@upstash/redis'
@@ -63,6 +64,15 @@ function sanitizeToE164NoPlus(rawDigits) {
   let to = String(rawDigits || '').replace(/\D/g, '')
   if (to.startsWith('549')) to = '54' + to.slice(3) // quitar 9 para Arg
   return to
+}
+// PARCHE: acepta items devueltos como string JSON o como objeto ya parseado
+function parseMaybe(row) {
+  if (!row) return null
+  if (typeof row === 'string') {
+    try { return JSON.parse(row) } catch { return null }
+  }
+  if (typeof row === 'object') return row
+  return null
 }
 
 // --- Sesiones ---
@@ -153,7 +163,7 @@ async function getHistory(waInput, limit = 100) {
   // A) ZSET exacto: últimos N con REV (índice 0..limit-1)
   try {
     const rows = await redis.zrevrange(zKeyExact, 0, limit - 1)
-    const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+    const parsed = (rows || []).map(parseMaybe).filter(Boolean)
     if (parsed.length) {
       all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0))
       hitKeys.push(zKeyExact)
@@ -168,12 +178,12 @@ async function getHistory(waInput, limit = 100) {
     try {
       // 1) head→tail (LPUSH: cabezas más nuevas)
       let arr = await redis.lrange(listKeyExact, 0, limit - 1)
-      let parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+      let parsed = (arr || []).map(parseMaybe).filter(Boolean)
 
       // 2) fallback: tail (índices negativos)
       if (!parsed.length) {
         arr = await redis.lrange(listKeyExact, -limit, -1)
-        parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+        parsed = (arr || []).map(parseMaybe).filter(Boolean)
       }
 
       if (parsed.length) {
@@ -200,7 +210,7 @@ async function getHistory(waInput, limit = 100) {
       const zKey = kMsgsZ(v)
       try {
         const rows = await redis.zrevrange(zKey, 0, limit - 1)
-        const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+        const parsed = (rows || []).map(parseMaybe).filter(Boolean)
         if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(zKey) }
       } catch {}
     }
@@ -213,10 +223,10 @@ async function getHistory(waInput, limit = 100) {
         const listKey = kMsgs(v)
         try {
           let arr = await redis.lrange(listKey, 0, limit - 1)
-          let parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+          let parsed = (arr || []).map(parseMaybe).filter(Boolean)
           if (!parsed.length) {
             arr = await redis.lrange(listKey, -limit, -1)
-            parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+            parsed = (arr || []).map(parseMaybe).filter(Boolean)
           }
           if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKey) }
         } catch {}
@@ -244,13 +254,13 @@ async function getHistory(waInput, limit = 100) {
                 let parsed = []
                 if (key.endsWith(':z')) {
                   const rows = await redis.zrevrange(key, 0, limit - 1)
-                  parsed = (rows || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  parsed = (rows || []).map(parseMaybe).filter(Boolean)
                 } else {
                   let arr = await redis.lrange(key, 0, limit - 1)
-                  parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  parsed = (arr || []).map(parseMaybe).filter(Boolean)
                   if (!parsed.length) {
                     arr = await redis.lrange(key, -limit, -1)
-                    parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                    parsed = (arr || []).map(parseMaybe).filter(Boolean)
                   }
                 }
                 if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(key); break }
