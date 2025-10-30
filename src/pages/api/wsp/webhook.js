@@ -84,7 +84,7 @@ async function appendMessage(waKey, msg) {
   }
 }
 
-// --- Feed (variantes + SCAN fallback) ---
+// --- Feed (exacto + variantes + SCAN) ---
 async function getHistory(waInput, limit = 100) {
   const raw = String(waInput || '').trim()
   const withPlus = raw.startsWith('+') ? raw : `+${raw}`
@@ -92,19 +92,34 @@ async function getHistory(waInput, limit = 100) {
   const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
   const argentina9 = withPlus.replace(/^\+54(?!9)/, '+549')
 
-  const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
+  const exactListKey = kMsgs(withPlus)
   let all = []
   let hitKeys = []
 
-  // 1) variantes directas
-  for (const v of variants) {
-    const k = v.startsWith('+') ? v : `+${v}`
-    const listKey = kMsgs(k)
-    try {
-      const arr = await redis.lrange(listKey, 0, limit - 1)
+  // 0) Intento EXACTO primero (la misma clave a la que escribimos)
+  try {
+    const len = await redis.llen(exactListKey)
+    if (typeof len === 'number' && len > 0) {
+      const arr = await redis.lrange(exactListKey, 0, limit - 1)
       const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) { all = all.concat(parsed); hitKeys.push(listKey) }
-    } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'variants', listKey, err: String(e) }) }
+      if (parsed.length) { all = parsed; hitKeys.push(exactListKey) }
+    }
+  } catch (e) {
+    flowLog('FEED_HISTORY_ERR', { stage: 'exact', listKey: exactListKey, err: String(e) })
+  }
+
+  // 1) variantes directas si aún vacío
+  if (!all.length) {
+    const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
+    for (const v of variants) {
+      const k = v.startsWith('+') ? v : `+${v}`
+      const listKey = kMsgs(k)
+      try {
+        const arr = await redis.lrange(listKey, 0, limit - 1)
+        const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+        if (parsed.length) { all = all.concat(parsed); hitKeys.push(listKey) }
+      } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'variants', listKey, err: String(e) }) }
+    }
   }
 
   // 2) SCAN si nada
@@ -148,7 +163,7 @@ async function alreadyProcessed(wa, messageId) {
   return false
 }
 
-// --- Envío a WhatsApp (con fallback) ---
+// --- Envío a WhatsApp (con fallback y detección de error en body) ---
 async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
     flowLog('SEND_GUARD', { error: 'Missing WhatsApp env', WHATSAPP_PHONE_ID: !!WHATSAPP_PHONE_ID, WHATSAPP_TOKEN: !!WHATSAPP_TOKEN })
@@ -163,7 +178,8 @@ async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
   })
   let data = {}
   try { data = await res.json() } catch {}
-  flowLog(label, { to, status: res.status, data })
+  const ok = res.ok && !data?.error // <<—— IMPORTANTE: 200 con error en body => ok=false
+  flowLog(label, { to, status: res.status, ok, data })
 
   // snapshot OUT para consola
   try {
@@ -185,12 +201,25 @@ async function sendJson(toRawDigits, payload, storeKey, label = 'SEND_JSON') {
     await appendMessage(storeKey, snap)
   } catch {}
 
-  return { ok: res.ok, status: res.status, data }
+  return { ok, status: res.status, data }
 }
 
 const sendText = (to, body, storeKey) =>
   sendJson(to, { type: 'text', text: { body } }, storeKey, 'SEND_TEXT')
 
+const sendMenuTextFallback = async (to, storeKey) => {
+  const text =
+`Menú (texto):
+1) 📍 Sedes
+2) 🧾 Estudios
+3) 💳 Obras sociales
+4) 📤 Envío de estudio
+5) 📎 Subir orden
+6) 👤 Operador
+
+Respondé con el número de la opción.`
+  await sendText(to, text, storeKey)
+}
 const sendButtons = async (to, body, buttons, storeKey) => {
   const payload = {
     type: 'interactive',
@@ -206,26 +235,9 @@ const sendButtons = async (to, body, buttons, storeKey) => {
     }
   }
   const r = await sendJson(to, payload, storeKey, 'SEND_BUTTONS')
-
-  // Fallback si falla enviar botones (fuera de 24h, etc.)
-  if (!r.ok) await sendMenuTextFallback(to, storeKey)
+  if (!r.ok) await sendMenuTextFallback(to, storeKey) // << fallback seguro
   return r
 }
-
-const sendMenuTextFallback = async (to, storeKey) => {
-  const text =
-`Menú (texto):
-1) 📍 Sedes
-2) 🧾 Estudios
-3) 💳 Obras sociales
-4) 📤 Envío de estudio
-5) 📎 Subir orden
-6) 👤 Operador
-
-Respondé con el número de la opción.`
-  await sendText(to, text, storeKey)
-}
-
 const sendList = async (to, body, sections, storeKey) => {
   const r = await sendJson(to, { type: 'interactive', interactive: { type: 'list', body: { text: body || '' }, action: { button: 'Ver opciones', sections } } }, storeKey, 'SEND_LIST')
   if (!r.ok) await sendMenuTextFallback(to, storeKey)
@@ -406,13 +418,13 @@ ${NO_TURNO}`
 async function routeMenuSelection(waRaw, wa, selRaw) {
   const selUpper = (selRaw || '').toUpperCase()
 
-  // Mapear menús de texto (1..6)
-  if (/^\s*1\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_SEDES')
-  if (/^\s*2\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_ESTUDIOS')
-  if (/^\s*3\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_OBRAS')
-  if (/^\s*4\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_ENVIO')
-  if (/^\s*5\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_SUBIR_ORDEN')
-  if (/^\s*6\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_OPERADOR')
+  // Mapear menús de texto (1..6) con espacios/ruido
+  if (/^\s*1\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_SEDES')
+  if (/^\s*2\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_ESTUDIOS')
+  if (/^\s*3\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_OBRAS')
+  if (/^\s*4\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_ENVIO')
+  if (/^\s*5\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_SUBIR_ORDEN')
+  if (/^\s*6\s*\.?\s*$/.test(selRaw)) return routeMenuSelection(waRaw, wa, 'MENU_OPERADOR')
 
   // Fuzzy: "envío de estudio"
   if (/ENV[IÍ]O.*ESTUDIO/.test(selUpper)) return routeMenuSelection(waRaw, wa, 'MENU_ENVIO')
@@ -481,7 +493,7 @@ async function routeIncomingMessage(waRaw, wa, kind, payloadTextOrId, payloadTit
   if (!sess || sess.state === 'idle') {
     if (kind === 'text') {
       const t = (payloadTextOrId || '').toLowerCase()
-      const isCmd = /(envio|envío).*(estudio)/.test(t) || /^[1-6]$/.test(t)
+      const isCmd = /(envio|envío).*(estudio)/.test(t) || /^\s*[1-6]\s*$/.test(t) // << acepta espacios
       if (!isCmd) { await sendWelcome(waRaw, wa); return }
     }
   }
@@ -497,7 +509,7 @@ async function routeIncomingMessage(waRaw, wa, kind, payloadTextOrId, payloadTit
   if (kind === 'text') {
     const text = payloadTextOrId || ''
     flowLog('TEXT_STEP', { wa, text })
-    if (/(envio|envío).*(estudio)/i.test(text) || /^[1-6]$/.test((text || '').trim())) {
+    if (/(envio|envío).*(estudio)/i.test(text) || /^\s*[1-6]\s*$/.test((text || '').trim())) {
       await routeMenuSelection(waRaw, wa, text); return
     }
     if (await handleEnvioText(waRaw, wa, text)) return
@@ -531,8 +543,14 @@ export default async function handler(req, res) {
         const now = Date.now()
         const a = await appendMessage(w, { id: `probe-in-${now}`, from: w, direction: 'in', text: `[probe IN ${now}]`, ts: now })
         const b = await appendMessage(w, { id: `probe-out-${now}`, from: w, direction: 'out', text: `[probe OUT ${now}]`, ts: now + 1 })
-        const { messages, hitKeys } = await getHistory(w, lim)
-        return res.status(200).json({ wa: w, probe: { wroteTo: [a.listKey, b.listKey], writeOk: !!(a.ok && b.ok) }, found: { hitKeys, count: messages.length }, sample: messages.slice(-3) })
+        // pequeño reintento por consistencia eventual
+        let read
+        for (let i = 0; i < 3; i++) {
+          read = await getHistory(w, lim)
+          if ((read.messages || []).length) break
+          await new Promise(r => setTimeout(r, 120))
+        }
+        return res.status(200).json({ wa: w, probe: { wroteTo: [a.listKey, b.listKey], writeOk: !!(a.ok && b.ok) }, found: { hitKeys: read.hitKeys, count: read.messages.length }, sample: read.messages.slice(-3) })
       }
 
       // DEBUG: lista claves candidatas + conteos
