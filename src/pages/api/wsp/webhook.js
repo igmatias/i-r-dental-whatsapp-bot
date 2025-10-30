@@ -4,7 +4,7 @@
 // - Menú interactivo con fallback numerado
 // - Flujo “Envío de estudio” completo
 // - Endpoints operador (send / send-media)
-// - GET ?probe=1 / ?debug=1 / ?ping=1 para diagnóstico
+// - GET ?probe=1 / ?debug=1 / ?peek=1 / ?ping=1 (diagnóstico)
 // - appendMessage con métricas duras de escritura/lectura
 // ==============================================
 
@@ -120,7 +120,7 @@ async function appendMessage(waKey, msg) {
     result.after.llen = Number(llenAfter ?? 0)
     const zcardAfter = await redis.zcard(zKey).catch(() => null)
     result.after.zcard = Number(zcardAfter ?? 0)
-    const lastZ = await redis.zrange(zKey, -1, -1)
+    const lastZ = await redis.zrevrange(zKey, 0, 0)
     result.after.lastZ = (Array.isArray(lastZ) && lastZ[0]) ? 'ok' : 'empty'
 
     result.ok = true
@@ -141,7 +141,7 @@ async function appendMessage(waKey, msg) {
   }
 }
 
-// --- Feed (ZSET → LIST → variantes → SCAN) ---
+// --- Feed (ZSET → LIST → variantes → SCAN + fallbacks robustos) ---
 async function getHistory(waInput, limit = 100) {
   const raw = String(waInput || '').trim()
   const withPlus = raw.startsWith('+') ? raw : `+${raw}`
@@ -150,102 +150,116 @@ async function getHistory(waInput, limit = 100) {
   let all = []
   let hitKeys = []
 
-  // A) ZSET exacto (últimos N)
+  // A) ZSET exacto: últimos N con REV (índice 0..limit-1)
   try {
-    const rows = await redis.zrange(zKeyExact, -limit, -1)     // de los últimos N por score
+    const rows = await redis.zrevrange(zKeyExact, 0, limit - 1)
     const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-    if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(zKeyExact) }
-    flowLog('FEED_HISTORY_Z', { zKeyExact, got: parsed.length })
+    if (parsed.length) {
+      all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0))
+      hitKeys.push(zKeyExact)
+    }
+    flowLog('FEED_HISTORY_ZREV', { zKeyExact, got: parsed.length })
   } catch (e) {
-    flowLog('FEED_HISTORY_ERR', { stage: 'z-exact', zKeyExact, err: String(e) })
+    flowLog('FEED_HISTORY_ERR', { stage: 'zrevrange-exact', zKeyExact, err: String(e) })
   }
 
   // B) LIST exacta si ZSET vacío
   if (!all.length) {
     try {
-      const arr = await redis.lrange(listKeyExact, 0, limit - 1)
-      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKeyExact) }
+      // 1) head→tail (LPUSH: cabezas más nuevas)
+      let arr = await redis.lrange(listKeyExact, 0, limit - 1)
+      let parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+
+      // 2) fallback: tail (índices negativos)
+      if (!parsed.length) {
+        arr = await redis.lrange(listKeyExact, -limit, -1)
+        parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+      }
+
+      if (parsed.length) {
+        all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0))
+        hitKeys.push(listKeyExact)
+      }
       flowLog('FEED_HISTORY_LIST', { listKeyExact, got: parsed.length })
     } catch (e) {
       flowLog('FEED_HISTORY_ERR', { stage: 'list-exact', listKeyExact, err: String(e) })
     }
   }
 
-  // C) Variantes + SCAN
+  // C) Variantes (ZSET/LIST) si aún vacío
   if (!all.length) {
     const noPlus       = withPlus.slice(1)
     const argentinaNo9 = withPlus.replace(/^\+549/, '+54')
     const argentina9   = withPlus.replace(/^\+54(?!9)/, '+549')
     const variants = Array.from(new Set([withPlus, noPlus, argentinaNo9, argentina9])).filter(Boolean)
 
-    // 1) ZSET variantes
-    for (const v of variants) {
+    // ZSET variantes
+    for (const vRaw of variants) {
       if (all.length) break
-      const zKey = kMsgsZ(v.startsWith('+') ? v : `+${v}`)
+      const v = vRaw.startsWith('+') ? vRaw : `+${vRaw}`
+      const zKey = kMsgsZ(v)
       try {
-        const rows = await redis.zrange(zKey, -limit, -1)
+        const rows = await redis.zrevrange(zKey, 0, limit - 1)
         const parsed = (rows || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
         if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(zKey) }
       } catch {}
     }
 
-    // 2) LIST variantes
+    // LIST variantes
     if (!all.length) {
-      for (const v of variants) {
-        const listKey = kMsgs(v.startsWith('+') ? v : `+${v}`)
+      for (const vRaw of variants) {
+        if (all.length) break
+        const v = vRaw.startsWith('+') ? vRaw : `+${vRaw}`
+        const listKey = kMsgs(v)
         try {
-          const arr = await redis.lrange(listKey, 0, limit - 1)
-          const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-          if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKey); break }
+          let arr = await redis.lrange(listKey, 0, limit - 1)
+          let parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+          if (!parsed.length) {
+            arr = await redis.lrange(listKey, -limit, -1)
+            parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+          }
+          if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(listKey) }
         } catch {}
       }
     }
-
-    // 3) SCAN (busca :z y :messages)
-    if (!all.length) {
-      try {
-        const digits = withPlus.replace(/\D/g, '')
-        const needleShort = digits.slice(-7)
-        const needleNo9   = digits.replace(/^549/, '54')
-        const needle9     = digits.replace(/^54(?!9)/, '549')
-        let cursor = 0
-        do {
-          const [next, keys] = await redis.scan(cursor, { match: 'chat:*', count: 200 })
-          cursor = Number(next) || 0
-          for (const k of (keys || [])) {
-            const s = String(k)
-            if (s.endsWith(':z') || s.endsWith(':messages')) {
-              if (
-                s.includes(needleShort) || s.includes(needleNo9) || s.includes(needle9) ||
-                s.includes(withPlus.replace('+','')) || s.includes(noPlus)
-              ) {
-                try {
-                  let parsed = []
-                  if (s.endsWith(':z')) {
-                    const rows = await redis.zrange(s, -limit, -1)
-                    parsed = (rows || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
-                  } else {
-                    const arr = await redis.lrange(s, 0, limit - 1)
-                    parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
-                  }
-                  if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(s); break }
-                } catch {}
-              }
-            }
-          }
-        } while (cursor !== 0 && !all.length)
-      } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) }) }
-    }
   }
 
-  // Fallback extremo: reintento directo a LIST exacta
+  // D) SCAN como última bala
   if (!all.length) {
     try {
-      const arr = await redis.lrange(kMsgs(withPlus), 0, limit - 1)
-      const parsed = (arr || []).map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
-      if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(kMsgs(withPlus)) }
-    } catch {}
+      const digits = withPlus.replace(/\D/g, '')
+      const needleShort = digits.slice(-7)
+      const needleNo9   = digits.replace(/^549/, '54')
+      const needle9     = digits.replace(/^54(?!9)/, '549')
+      let cursor = 0
+      do {
+        const [next, keys] = await redis.scan(cursor, { match: 'chat:*', count: 200 })
+        cursor = Number(next) || 0
+        for (const s of (keys || [])) {
+          const key = String(s)
+          if (key.endsWith(':z') || key.endsWith(':messages')) {
+            if (key.includes(needleShort) || key.includes(needleNo9) || key.includes(needle9) ||
+                key.includes(withPlus.replace('+','')) || key.includes(withPlus.slice(1))) {
+              try {
+                let parsed = []
+                if (key.endsWith(':z')) {
+                  const rows = await redis.zrevrange(key, 0, limit - 1)
+                  parsed = (rows || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                } else {
+                  let arr = await redis.lrange(key, 0, limit - 1)
+                  parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  if (!parsed.length) {
+                    arr = await redis.lrange(key, -limit, -1)
+                    parsed = (arr || []).map(x => { try { return JSON.parse(x) } catch { return null } }).filter(Boolean)
+                  }
+                }
+                if (parsed.length) { all = parsed.sort((a,b)=>(a.ts||0)-(b.ts||0)); hitKeys.push(key); break }
+              } catch {}
+            }
+          }
+        }
+      } while (cursor !== 0 && !all.length)
+    } catch (e) { flowLog('FEED_HISTORY_ERR', { stage: 'scan', err: String(e) }) }
   }
 
   flowLog('FEED_HISTORY_MERGE', { wa: withPlus, total: all.length, hitKeys })
@@ -643,6 +657,21 @@ export default async function handler(req, res) {
     if (wa) {
       const lim = parseInt(limit, 10) || 100
 
+      // PEEK: quick snapshot de estado real en Upstash
+      if (req.query.peek === '1') {
+        const w = ensurePlus(wa)
+        const out = {
+          wa: w,
+          llen: await redis.llen(kMsgs(w)).catch(e => `ERR ${e}`),
+          zcard: await redis.zcard(kMsgsZ(w)).catch(e => `ERR ${e}`),
+          list_head: await redis.lrange(kMsgs(w), 0, 2).catch(e => `ERR ${e}`),
+          list_tail: await redis.lrange(kMsgs(w), -3, -1).catch(e => `ERR ${e}`),
+          z_rev: await redis.zrevrange(kMsgsZ(w), 0, 2).catch(e => `ERR ${e}`),
+          z_norm: await redis.zrange(kMsgsZ(w), 0, 2).catch(e => `ERR ${e}`)
+        }
+        return res.status(200).json(out)
+      }
+
       // PROBE: escribe 2 mensajes, verifica escrituras y lee (debug fuerte)
       if (req.query.probe === '1') {
         const w = ensurePlus(wa)
@@ -697,11 +726,15 @@ export default async function handler(req, res) {
           for (const ck of candidates) {
             try {
               if (ck.endsWith(':z')) {
-                const rows = await redis.zrange(ck, -3, -1)
+                const rows = await redis.zrevrange(ck, 0, 2)
                 counts[ck] = Array.isArray(rows) ? rows.length : 0
               } else {
-                const arr = await redis.lrange(ck, 0, 2)
+                let arr = await redis.lrange(ck, 0, 2)
                 counts[ck] = Array.isArray(arr) ? arr.length : 0
+                if (!counts[ck]) {
+                  arr = await redis.lrange(ck, -3, -1)
+                  counts[ck] = Array.isArray(arr) ? arr.length : 0
+                }
               }
             } catch (e) { counts[ck] = `ERR ${String(e)}` }
           }
@@ -716,7 +749,7 @@ export default async function handler(req, res) {
     }
 
     // Lista de chats
-    const rows = await redis.zrange(kChats, 0, 49, { rev: true, withScores: true })
+    const rows = await redis.zrevrange(kChats, 0, 49, { withScores: true })
     const items = Array.isArray(rows) && rows.length && typeof rows[0] === 'object'
       ? rows.map(r => ({ wa: r.member, ts: Number(r.score) }))
       : (() => { const arr = []; for (let i = 0; i < rows.length; i += 2) arr.push({ wa: rows[i], ts: Number(rows[i + 1]) }); return arr })()
